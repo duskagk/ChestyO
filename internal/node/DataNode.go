@@ -1,5 +1,6 @@
 package node
 
+// internal/node/DataNode.go
 import (
 	"ChestyO/internal/store"
 	"ChestyO/internal/transport"
@@ -8,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -73,7 +76,47 @@ func (d *DataNode) DownloadFile(ctx context.Context, req *transport.DownloadFile
 
 // DeleteFile deletes a file from the distributed system
 func (d *DataNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
-	return nil, nil
+	log.Printf("DataNode %s: Attempting to delete file %s for user %s", d.ID, req.Filename, req.UserId)
+
+	pathKey := d.store.PathTransformFunc(req.Filename)
+	dirPath := filepath.Join(d.store.Root, req.UserId, pathKey.Pathname)
+
+	// 디렉토리 내의 모든 청크 파일 삭제
+	files, err := ioutil.ReadDir(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("DataNode %s: Directory not found for file %s", d.ID, req.Filename)
+			return &transport.DeleteFileResponse{
+				Success: false,
+				Message: fmt.Sprintf("File %s not found", req.Filename),
+			}, nil
+		}
+		return nil, fmt.Errorf("error reading directory: %v", err)
+	}
+
+	deletedCount := 0
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), req.Filename+"_chunk_") {
+			err := os.Remove(filepath.Join(dirPath, file.Name()))
+			if err != nil {
+				log.Printf("DataNode %s: Error deleting chunk %s: %v", d.ID, file.Name(), err)
+			} else {
+				deletedCount++
+			}
+		}
+	}
+
+	// 빈 디렉토리 삭제
+	err = os.Remove(dirPath)
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("DataNode %s: Warning: Could not delete empty directory %s: %v", d.ID, dirPath, err)
+	}
+
+	log.Printf("DataNode %s: Deleted %d chunks for file %s", d.ID, deletedCount, req.Filename)
+	return &transport.DeleteFileResponse{
+		Success: true,
+		Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+	}, nil
 }
 
 // ListFiles lists files in a directory
