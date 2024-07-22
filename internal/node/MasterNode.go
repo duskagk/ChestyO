@@ -1,6 +1,9 @@
 package node
 
+// internal/node/MasterNode.go
+
 import (
+	policy "ChestyO/internal/enum"
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
 	"context"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -31,18 +35,9 @@ func NewMasterNode(id string) *MasterNode {
 }
 
 func (m *MasterNode) HasFile(userId, filename string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, dataNode := range m.dataNodes {
-		// 첫 번째 청크의 존재 여부만 확인
-		// chunkFilename := fmt.Sprintf("%s_chunk_0", filename)
-		if dataNode.HasFile(userId, filename) {
-			return true
-		}
-	}
-
-	return false
+	resultChan := make(chan bool)
+	go m.hasFileAsync(userId, filename, resultChan)
+	return <-resultChan
 }
 
 // node/master.go
@@ -51,20 +46,14 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 	fileExists := m.HasFile(req.UserID, req.Filename)
 
 	if fileExists {
-		log.Printf("File Already exist")
-		return nil
-		// switch req.Policy {
-		// case policy.Overwrite:
-		//     return m.handleOverwrite(ctx, req, createStream)
-		// case policy.VersionControl:
-		//     return m.handleVersionControl(ctx, req, createStream)
-		// case policy.Deduplication:
-		//     return m.handleDeduplication(ctx, req, createStream)
-		// case policy.IncrementalUpdate:
-		//     return m.handleIncrementalUpdate(ctx, req, createStream)
-		// default:
-		//     return fmt.Errorf("unsupported policy for existing file: %v", req.Policy)
-		// }
+		switch req.Policy {
+		case policy.Overwrite:
+			return m.handleOverwrite(ctx, req, createStream)
+		case policy.VersionControl:
+			return m.handleVersionControl(ctx, req, createStream)
+		default:
+			return fmt.Errorf("can't")
+		}
 	} else {
 		// 새 파일 업로드
 		return m.handleNewUpload(ctx, req, createStream)
@@ -114,7 +103,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 		if err != nil {
 			return fmt.Errorf("failed to upload chunk %d to node %s: %v", i, dataNode.ID, err)
 		}
-		if !contains(m.fileLocations[req.Filename], dataNode.ID) {
+		if !utils.Contains(m.fileLocations[req.Filename], dataNode.ID) {
 			m.fileLocations[req.Filename] = append(m.fileLocations[req.Filename], dataNode.ID)
 		}
 
@@ -125,91 +114,180 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 }
 
 func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-	// 기존 파일 삭제 후 새 파일 저장
-	// m.deleteFile(req.Filename)
-	// return m.saveFile(ctx, req, createStream)
-	return nil
+	deleteReq := &transport.DeleteFileRequest{
+		Filename: req.Filename,
+		UserId:   req.UserID,
+	}
+	_, err := m.handleDeleteFile(ctx, deleteReq)
+	if err != nil {
+		return fmt.Errorf("failed to delete exist file : %v", err)
+	}
+
+	return m.handleNewUpload(ctx, req, createStream)
 }
 
 func (m *MasterNode) handleVersionControl(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-	// 새 버전으로 파일 저장
-	// version := m.getNextVersion(req.Filename)
-	// req.Filename = fmt.Sprintf("%s_v%d", req.Filename, version)
-	// return m.saveFile(ctx, req, createStream)
+
 	return nil
 }
-
-func (m *MasterNode) handleDeduplication(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-	// 파일 내용의 해시를 계산하여 중복 확인
-	// hash, err := m.calculateFileHash(createStream)
-	// if err != nil {
-	//     return err
-	// }
-	// if existingFile := m.findFileByHash(hash); existingFile != "" {
-	//     // 중복된 파일이 있으면 새 파일명으로 링크 생성
-	//     return m.createLink(existingFile, req.Filename)
-	// }
-	// 중복이 없으면 새로 저장
-	// return m.saveFile(ctx, req, createStream)
-	return nil
-}
-
-func (m *MasterNode) handleIncrementalUpdate(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-	// 기존 파일과 새 파일의 차이를 계산하여 변경된 부분만 업데이트
-	// diff, err := m.calculateDiff(req.Filename, createStream)
-	// if err != nil {
-	//     return err
-	// }
-	// return m.applyDiff(req.Filename, diff)
-	return nil
-}
-
-// func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
-//     m.mu.RLock()
-//     defer m.mu.RUnlock()
-
-//     log.Printf("Attempting to download file: %s for user: %s", req.Filename, req.UserId)
-
-//     fds, ok := stream.(*transport.FileDownloadStream)
-//     if !ok {
-//         return fmt.Errorf("unsupported stream type")
-//     }
-
-//     fileFound := false
-//     chunkIndex := 0
-
-//     for {
-//         chunkName := fmt.Sprintf("%s_chunk_%d", req.Filename, chunkIndex)
-//         chunkFound := false
-
-//         for _, dataNode := range m.dataNodes {
-//             if dataNode.HasFile(req.UserId, req.Filename) {
-//                 chunkData, err := dataNode.ReadChunk(req.UserId, req.Filename, chunkName)
-//                 if err == nil {
-//                     fds.AddChunk(chunkData)
-//                     chunkFound = true
-//                     fileFound = true
-//                     break
-//                 }
-//                 log.Printf("Error reading chunk from node %s: %v", dataNode.ID, err)
-//             }
-//         }
-
-//         if !chunkFound {
-//             break
-//         }
-
-//         chunkIndex++
-//     }
-
-//     if !fileFound {
-//         return fmt.Errorf("file not found: %s", req.Filename)
-//     }
-
-//     return nil
-// }
 
 func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
+
+	if isExist := m.HasFile(req.UserId, req.Filename); isExist {
+		return m.handleDownloadFile(ctx, req, stream)
+	}
+	return fmt.Errorf("file not found: %s", req.Filename)
+}
+
+func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
+	exists := m.HasFile(req.UserId, req.Filename)
+	if !exists {
+		return &transport.DeleteFileResponse{
+			Success: false,
+			Message: fmt.Sprintf("File %s not found", req.Filename),
+		}, nil
+	}
+
+	return m.handleDeleteFile(ctx, req)
+}
+
+func (m *MasterNode) handleDeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
+	m.mu.RLock()
+	dataNodes := make([]*DataNode, 0, len(m.dataNodes))
+	for _, node := range m.dataNodes {
+		dataNodes = append(dataNodes, node)
+	}
+	m.mu.RUnlock()
+
+	log.Printf("Attempting to delete file: %s for user: %s", req.Filename, req.UserId)
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(dataNodes))
+
+	for _, dataNode := range dataNodes {
+		wg.Add(1)
+		go func(node *DataNode) {
+			defer wg.Done()
+			response, err := node.DeleteFile(ctx, req)
+			if err != nil {
+				errChan <- fmt.Errorf("error deleting file %s from node %s: %v", req.Filename, node.ID, err)
+			} else if !response.Success {
+				errChan <- fmt.Errorf("failed to delete file %s from node %s: %s", req.Filename, node.ID, response.Message)
+			}
+		}(dataNode)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	var errors []string
+	for err := range errChan {
+		errors = append(errors, err.Error())
+	}
+
+	m.mu.Lock()
+	delete(m.fileLocations, req.Filename)
+	m.mu.Unlock()
+	log.Printf("Removed file %s from fileLocations", req.Filename)
+
+	if len(errors) > 0 {
+		return &transport.DeleteFileResponse{
+			Success: false,
+			Message: fmt.Sprintf("Partial deletion occurred: %s", strings.Join(errors, "; ")),
+		}, fmt.Errorf("deletion errors: %s", strings.Join(errors, "; "))
+	}
+
+	return &transport.DeleteFileResponse{
+		Success: true,
+		Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+	}, nil
+}
+
+func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequest) (*transport.ListFilesResponse, error) {
+	// 구현 로직
+	return nil, nil
+}
+
+func (m *MasterNode) Start(transport *transport.TCPTransport) error {
+	m.transport = transport
+	return m.transport.Serve()
+}
+
+func (m *MasterNode) Stop() {
+	if m.transport != nil {
+		m.transport.Close()
+	}
+}
+
+func (m *MasterNode) AddDataNode(argDataName string, argNode *DataNode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dataNodes[argDataName] = argNode
+}
+
+func RunMasterNode(id, addr string) error {
+	master := NewMasterNode(id)
+
+	// TCP 전송 설정
+	transport, err := transport.NewTCPTransport(addr, master)
+	if err != nil {
+		return fmt.Errorf("failed to set up TCP transport: %v", err)
+	}
+
+	fmt.Printf("Master node %s running on %s\n", id, addr)
+
+	// 종료 신호를 받을 채널 생성
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// 마스터 노드 작업을 별도의 고루틴에서 실행
+	go func() {
+		if err := master.Start(transport); err != nil {
+			fmt.Printf("Error in master node operations: %v\n", err)
+			stop <- os.Interrupt // 오류 발생 시 종료 신호 전송
+		}
+	}()
+
+	// 종료 신호를 기다림
+	<-stop
+
+	fmt.Println("Shutting down master node...")
+	master.Stop() // 마스터 노드 정리 작업 수행
+
+	return nil
+}
+
+func (m *MasterNode) hasFileAsync(userId, filename string, resultChan chan<- bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	foundFile := false
+	done := make(chan struct{})
+
+	for _, dataNode := range m.dataNodes {
+		wg.Add(1)
+		go func(node *DataNode) {
+			defer wg.Done()
+			if node.HasFile(userId, filename) {
+				select {
+				case <-done:
+					// 이미 파일을 찾았으므로 아무것도 하지 않음
+				default:
+					close(done)
+					foundFile = true
+				}
+			}
+		}(dataNode)
+	}
+
+	go func() {
+		wg.Wait()
+		resultChan <- foundFile
+	}()
+}
+
+func (m *MasterNode) handleDownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -261,88 +339,5 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
 
 	log.Printf("Successfully downloaded file %s with %d chunks", req.Filename, len(allChunks))
 	return nil
-}
 
-func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
-	// 구현 로직
-	return nil, nil
-}
-
-func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequest) (*transport.ListFilesResponse, error) {
-	// 구현 로직
-	return nil, nil
-}
-
-func (m *MasterNode) Start(transport *transport.TCPTransport) error {
-	m.transport = transport
-	return m.transport.Serve()
-}
-
-func (m *MasterNode) Stop() {
-	if m.transport != nil {
-		m.transport.Close()
-	}
-}
-
-func (m *MasterNode) AddDataNode(argDataName string, argNode *DataNode) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.dataNodes[argDataName] = argNode
-}
-
-func (m *MasterNode) selectDataNode() *DataNode {
-	// 간단한 라운드 로빈 방식으로 데이터 노드 선택
-	for _, node := range m.dataNodes {
-		return node
-	}
-	return nil
-}
-
-func RunMasterNode(id, addr string) error {
-	master := NewMasterNode(id)
-
-	// TCP 전송 설정
-	transport, err := transport.NewTCPTransport(addr, master)
-	if err != nil {
-		return fmt.Errorf("failed to set up TCP transport: %v", err)
-	}
-
-	fmt.Printf("Master node %s running on %s\n", id, addr)
-
-	// 종료 신호를 받을 채널 생성
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	// 마스터 노드 작업을 별도의 고루틴에서 실행
-	go func() {
-		if err := master.Start(transport); err != nil {
-			fmt.Printf("Error in master node operations: %v\n", err)
-			stop <- os.Interrupt // 오류 발생 시 종료 신호 전송
-		}
-	}()
-
-	// 종료 신호를 기다림
-	<-stop
-
-	fmt.Println("Shutting down master node...")
-	master.Stop() // 마스터 노드 정리 작업 수행
-
-	return nil
-}
-
-func (m *MasterNode) sendChunkToStream(stream transport.DownloadStream, chunkData []byte) error {
-	if fds, ok := stream.(*transport.FileDownloadStream); ok {
-		fds.AddChunk(chunkData)
-		return nil
-	}
-	return fmt.Errorf("unsupported stream type")
-}
-
-func contains(slice []string, item string) bool {
-	for _, a := range slice {
-		if a == item {
-			return true
-		}
-	}
-	return false
 }

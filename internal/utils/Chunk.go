@@ -9,15 +9,24 @@ import (
 const ChunkSize = 50 // 1MB
 
 func SplitFileIntoChunks(content []byte) []transport.FileChunk {
-    var chunks []transport.FileChunk
-    for i := 0; i < len(content); i += ChunkSize {
-        end := i + ChunkSize
-        if end > len(content) {
-            end = len(content)
-        }
-        chunks = append(chunks, transport.FileChunk{
-            Content: content[i:end],
-        })
-    }
-    return chunks
+	var chunks []transport.FileChunk
+	for i := 0; i < len(content); i += ChunkSize {
+		end := i + ChunkSize
+		if end > len(content) {
+			end = len(content)
+		}
+		chunks = append(chunks, transport.FileChunk{
+			Content: content[i:end],
+		})
+	}
+	return chunks
+}
+
+func Contains(slice []string, item string) bool {
+	for _, a := range slice {
+		if a == item {
+			return true
+		}
+	}
+	return false
 }
