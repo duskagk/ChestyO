@@ -10,27 +10,33 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
-	"os/signal"
+	"net"
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 )
 
+type DataNodeInfo struct {
+    ID      string
+    Address string
+    Conn    net.Conn
+}
+
 type MasterNode struct {
-	ID            string
-	dataNodes     map[string]*DataNode
-	fileLocations map[string][]string
-	transport     *transport.TCPTransport
-	mu            sync.RWMutex
+    ID            string
+    dataNodes     map[string]*DataNodeInfo
+    fileLocations map[string][]string
+    userMutexes   sync.Map
+    transport     *transport.TCPTransport
+    mu            sync.RWMutex
 }
 
 func NewMasterNode(id string) *MasterNode {
 	return &MasterNode{
 		ID:            id,
-		dataNodes:     make(map[string]*DataNode),
+		dataNodes:     make(map[string]*DataNodeInfo),
 		fileLocations: make(map[string][]string),
+		userMutexes: sync.Map{},
 	}
 }
 
@@ -49,8 +55,6 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 		switch req.Policy {
 		case policy.Overwrite:
 			return m.handleOverwrite(ctx, req, createStream)
-		case policy.VersionControl:
-			return m.handleVersionControl(ctx, req, createStream)
 		default:
 			return fmt.Errorf("can't")
 		}
@@ -62,8 +66,9 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 
 func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
 	fmt.Printf("MasterNode: Starting file upload for %s\n", req.Filename)
-	m.mu.Lock()
-	defer m.mu.Unlock()
+    mu := m.getUserMutex(req.UserID)
+    mu.Lock()
+    defer mu.Unlock()
 
 	stream := createStream()
 	var fileContent []byte
@@ -81,7 +86,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 	chunks := utils.SplitFileIntoChunks(fileContent)
 	fmt.Printf("MasterNode: File split into %d chunks\n", len(chunks))
 
-	dataNodes := make([]*DataNode, 0, len(m.dataNodes))
+	dataNodes := make([]DataNodeInfo, 0, len(m.dataNodes))
 	for _, node := range m.dataNodes {
 		dataNodes = append(dataNodes, node)
 	}
@@ -116,7 +121,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
 	deleteReq := &transport.DeleteFileRequest{
 		Filename: req.Filename,
-		UserId:   req.UserID,
+		UserID:   req.UserID,
 	}
 	_, err := m.handleDeleteFile(ctx, deleteReq)
 	if err != nil {
@@ -126,21 +131,17 @@ func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadF
 	return m.handleNewUpload(ctx, req, createStream)
 }
 
-func (m *MasterNode) handleVersionControl(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-
-	return nil
-}
 
 func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
 
-	if isExist := m.HasFile(req.UserId, req.Filename); isExist {
+	if isExist := m.HasFile(req.UserID, req.Filename); isExist {
 		return m.handleDownloadFile(ctx, req, stream)
 	}
 	return fmt.Errorf("file not found: %s", req.Filename)
 }
 
 func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
-	exists := m.HasFile(req.UserId, req.Filename)
+	exists := m.HasFile(req.UserID, req.Filename)
 	if !exists {
 		return &transport.DeleteFileResponse{
 			Success: false,
@@ -152,55 +153,55 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
 }
 
 func (m *MasterNode) handleDeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
-	m.mu.RLock()
-	dataNodes := make([]*DataNode, 0, len(m.dataNodes))
-	for _, node := range m.dataNodes {
-		dataNodes = append(dataNodes, node)
-	}
-	m.mu.RUnlock()
+    mu := m.getUserMutex(req.UserID)
+    mu.Lock()
+    defer mu.Unlock()
+    
+    log.Printf("Attempting to delete file: %s for user: %s", req.Filename, req.UserID)
 
-	log.Printf("Attempting to delete file: %s for user: %s", req.Filename, req.UserId)
+    dataNodes := make([]*DataNode, 0, len(m.dataNodes))
+    for _, node := range m.dataNodes {
+        dataNodes = append(dataNodes, node)
+    }
 
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(dataNodes))
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(dataNodes))
 
-	for _, dataNode := range dataNodes {
-		wg.Add(1)
-		go func(node *DataNode) {
-			defer wg.Done()
-			response, err := node.DeleteFile(ctx, req)
-			if err != nil {
-				errChan <- fmt.Errorf("error deleting file %s from node %s: %v", req.Filename, node.ID, err)
-			} else if !response.Success {
-				errChan <- fmt.Errorf("failed to delete file %s from node %s: %s", req.Filename, node.ID, response.Message)
-			}
-		}(dataNode)
-	}
+    for _, dataNode := range dataNodes {
+        wg.Add(1)
+        go func(node *DataNode) {
+            defer wg.Done()
+            response, err := node.DeleteFile(ctx, req)
+            if err != nil {
+                errChan <- fmt.Errorf("error deleting file %s from node %s: %v", req.Filename, node.ID, err)
+            } else if !response.Success {
+                errChan <- fmt.Errorf("failed to delete file %s from node %s: %s", req.Filename, node.ID, response.Message)
+            }
+        }(dataNode)
+    }
 
-	wg.Wait()
-	close(errChan)
+    wg.Wait()
+    close(errChan)
 
-	var errors []string
-	for err := range errChan {
-		errors = append(errors, err.Error())
-	}
+    var errors []string
+    for err := range errChan {
+        errors = append(errors, err.Error())
+    }
 
-	m.mu.Lock()
-	delete(m.fileLocations, req.Filename)
-	m.mu.Unlock()
-	log.Printf("Removed file %s from fileLocations", req.Filename)
+    delete(m.fileLocations, req.Filename)
+    log.Printf("Removed file %s from fileLocations", req.Filename)
 
-	if len(errors) > 0 {
-		return &transport.DeleteFileResponse{
-			Success: false,
-			Message: fmt.Sprintf("Partial deletion occurred: %s", strings.Join(errors, "; ")),
-		}, fmt.Errorf("deletion errors: %s", strings.Join(errors, "; "))
-	}
+    if len(errors) > 0 {
+        return &transport.DeleteFileResponse{
+            Success: false,
+            Message: fmt.Sprintf("Partial deletion occurred: %s", strings.Join(errors, "; ")),
+        }, fmt.Errorf("deletion errors: %s", strings.Join(errors, "; "))
+    }
 
-	return &transport.DeleteFileResponse{
-		Success: true,
-		Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
-	}, nil
+    return &transport.DeleteFileResponse{
+        Success: true,
+        Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+    }, nil
 }
 
 func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequest) (*transport.ListFilesResponse, error) {
@@ -220,46 +221,25 @@ func (m *MasterNode) Stop() {
 }
 
 func (m *MasterNode) AddDataNode(argDataName string, argNode *DataNode) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.dataNodes[argDataName] = argNode
 }
 
 func RunMasterNode(id, addr string) error {
-	master := NewMasterNode(id)
+    master := NewMasterNode(id)
+    transport, err := transport.NewTCPTransport(addr, master)
+    if err != nil {
+        return fmt.Errorf("failed to set up TCP transport: %v", err)
+    }
+    master.transport = transport
 
-	// TCP 전송 설정
-	transport, err := transport.NewTCPTransport(addr, master)
-	if err != nil {
-		return fmt.Errorf("failed to set up TCP transport: %v", err)
-	}
-
-	fmt.Printf("Master node %s running on %s\n", id, addr)
-
-	// 종료 신호를 받을 채널 생성
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	// 마스터 노드 작업을 별도의 고루틴에서 실행
-	go func() {
-		if err := master.Start(transport); err != nil {
-			fmt.Printf("Error in master node operations: %v\n", err)
-			stop <- os.Interrupt // 오류 발생 시 종료 신호 전송
-		}
-	}()
-
-	// 종료 신호를 기다림
-	<-stop
-
-	fmt.Println("Shutting down master node...")
-	master.Stop() // 마스터 노드 정리 작업 수행
-
-	return nil
+    log.Printf("Master node %s running on %s", id, addr)
+    return transport.Serve()
 }
 
 func (m *MasterNode) hasFileAsync(userId, filename string, resultChan chan<- bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+    mu := m.getUserMutex(userId)
+    mu.Lock()
+    defer mu.Unlock()
 
 	var wg sync.WaitGroup
 	foundFile := false
@@ -288,10 +268,12 @@ func (m *MasterNode) hasFileAsync(userId, filename string, resultChan chan<- boo
 }
 
 func (m *MasterNode) handleDownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	
+    mu := m.getUserMutex(req.UserID)
+    mu.Lock()
+    defer mu.Unlock()
 
-	log.Printf("Attempting to download file: %s for user: %s", req.Filename, req.UserId)
+	log.Printf("Attempting to download file: %s for user: %s", req.Filename, req.UserID)
 
 	fds, ok := stream.(*transport.FileDownloadStream)
 	if !ok {
@@ -299,23 +281,23 @@ func (m *MasterNode) handleDownloadFile(ctx context.Context, req *transport.Down
 	}
 
 	allChunks := make(map[int][]byte)
-	var mu sync.Mutex
+	var tmp_mu sync.Mutex
 	var wg sync.WaitGroup
 
 	for _, dataNode := range m.dataNodes {
 		wg.Add(1)
 		go func(node *DataNode) {
 			defer wg.Done()
-			chunks, err := node.ReadAllChunks(req.UserId, req.Filename)
+			chunks, err := node.ReadAllChunks(req.UserID, req.Filename)
 			if err != nil {
 				log.Printf("Error reading chunks from node %s: %v", node.ID, err)
 				return
 			}
-			mu.Lock()
+			tmp_mu.Lock()
 			for index, chunk := range chunks {
 				allChunks[index] = chunk
 			}
-			mu.Unlock()
+			tmp_mu.Unlock()
 		}(dataNode)
 	}
 
@@ -340,4 +322,24 @@ func (m *MasterNode) handleDownloadFile(ctx context.Context, req *transport.Down
 	log.Printf("Successfully downloaded file %s with %d chunks", req.Filename, len(allChunks))
 	return nil
 
+}
+
+
+func (m *MasterNode) getUserMutex(userID string) *sync.RWMutex {
+    mu, _ := m.userMutexes.LoadOrStore(userID, &sync.RWMutex{})
+    return mu.(*sync.RWMutex)
+}
+
+func (m *MasterNode) handleRegister(conn net.Conn, msg *transport.RegisterMessage) error {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    m.dataNodes[msg.NodeID] = &DataNodeInfo{
+        ID:      msg.NodeID,
+        Address: conn.RemoteAddr().String(),
+        Conn:    conn,
+    }
+
+    log.Printf("Registered DataNode: %s at %s", msg.NodeID, conn.RemoteAddr().String())
+    return nil
 }

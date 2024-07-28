@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,8 +18,9 @@ import (
 )
 
 type DataNode struct {
-	ID    string
-	store *store.Store
+    ID         string
+    store      *store.Store
+    masterConn net.Conn
 }
 
 func NewDataNode(id string, storeOpts store.StoreOpts) *DataNode {
@@ -63,10 +65,19 @@ func (d *DataNode) HasFile(userId, filename string) bool {
 }
 
 func RunDataNode(id, addr, masterAddr string) error {
-	dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("/tmp/datanode_%s", id)})
-	fmt.Printf("Data node %s running on %s, connected to master %s\n", id, addr, masterAddr)
-	fmt.Print(dataNode.ID)
-	select {} // Keep the node running
+    dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("/tmp/datanode_%s", id)})
+    
+    if err := dataNode.RegisterWithMaster(masterAddr); err != nil {
+        return fmt.Errorf("failed to register with master: %v", err)
+    }
+
+    transport, err := transport.NewTCPTransport(addr, dataNode)
+    if err != nil {
+        return fmt.Errorf("failed to set up TCP transport: %v", err)
+    }
+
+    log.Printf("Data node %s running on %s, connected to master %s", id, addr, masterAddr)
+    return transport.Serve()
 }
 
 // DownloadFile downloads a file from the distributed system
@@ -76,10 +87,10 @@ func (d *DataNode) DownloadFile(ctx context.Context, req *transport.DownloadFile
 
 // DeleteFile deletes a file from the distributed system
 func (d *DataNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
-	log.Printf("DataNode %s: Attempting to delete file %s for user %s", d.ID, req.Filename, req.UserId)
+	log.Printf("DataNode %s: Attempting to delete file %s for user %s", d.ID, req.Filename, req.UserID)
 
 	pathKey := d.store.PathTransformFunc(req.Filename)
-	dirPath := filepath.Join(d.store.Root, req.UserId, pathKey.Pathname)
+	dirPath := filepath.Join(d.store.Root, req.UserID, pathKey.Pathname)
 
 	// 디렉토리 내의 모든 청크 파일 삭제
 	files, err := ioutil.ReadDir(dirPath)
@@ -210,4 +221,22 @@ func (d *DataNode) ReadChunk(userId, filename, chunkName string) ([]byte, error)
 
 	fmt.Printf("DataNode %s: Successfully read chunk %s. Size: %d bytes\n", d.ID, filename, size)
 	return data, nil
+}
+
+
+func (d *DataNode) RegisterWithMaster(masterAddr string) error {
+    conn, err := net.Dial("tcp", masterAddr)
+    if err != nil {
+        return err
+    }
+    d.masterConn = conn
+
+    // Send registration message
+    msg := &transport.Message{
+        Type: transport.MessageType_REGISTER,
+        RegisterMessage: &transport.RegisterMessage{
+            NodeID: d.ID,
+        },
+    }
+    return transport.SendMessage(conn, msg)
 }

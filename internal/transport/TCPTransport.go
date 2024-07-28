@@ -1,105 +1,159 @@
 package transport
 
-// internal/transport/TCPTransport.go
 import (
-	"encoding/binary"
+	"context"
+	"fmt"
 	"io"
+	"log"
 	"net"
 )
 
 type TCPTransport struct {
-	listener net.Listener
-	handler  FileService
+    listener net.Listener
+    handler  FileService
 }
 
 func NewTCPTransport(address string, handler FileService) (*TCPTransport, error) {
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return nil, err
-	}
-	return &TCPTransport{
-		listener: listener,
-		handler:  handler,
-	}, nil
+    listener, err := net.Listen("tcp", address)
+    if err != nil {
+        return nil, err
+    }
+    return &TCPTransport{
+        listener: listener,
+        handler:  handler,
+    }, nil
 }
 
 func (t *TCPTransport) Serve() error {
-	for {
-		conn, err := t.listener.Accept()
-		if err != nil {
-			return err
-		}
-		go t.handleConnection(conn)
-	}
+    for {
+        conn, err := t.listener.Accept()
+        if err != nil {
+            return err
+        }
+        go t.handleConnection(conn)
+    }
 }
 
-// Close Connection
 func (t *TCPTransport) Close() error {
-
-	return nil
+    return t.listener.Close()
 }
 
 func (t *TCPTransport) handleConnection(conn net.Conn) {
-	defer conn.Close()
-	for {
-		// Read message type
-		var msgType uint32
-		if err := binary.Read(conn, binary.BigEndian, &msgType); err != nil {
-			return
-		}
+    defer conn.Close()
+    for {
+        msg, err := ReceiveMessage(conn)
+        if err != nil {
+            if err != io.EOF {
+                log.Printf("Error receiving message: %v", err)
+            }
+            return
+        }
 
-		// Handle different message types
-		switch msgType {
-		case 1: // UploadFile
-			t.handleUploadFile(conn)
-		case 2: // DownloadFile
-			t.handleDownloadFile(conn)
-		case 3: // DeleteFile
-			t.handleDeleteFile(conn)
-		case 4: // ListFiles
-			t.handleListFiles(conn)
-		default:
-			return // Unknown message type
-		}
-	}
+        switch msg.Type {
+        case MessageType_REGISTER:
+            err = t.handleRegister(conn, msg.RegisterMessage)
+        case MessageType_UPLOAD:
+            err = t.handleUpload(conn, msg.UploadRequest)
+        case MessageType_DOWNLOAD:
+            err = t.handleDownload(conn, msg.DownloadRequest)
+        case MessageType_DELETE:
+            err = t.handleDelete(conn, msg.DeleteRequest)
+        case MessageType_LIST:
+            err = t.handleList(conn, msg.ListRequest)
+        default:
+            err = fmt.Errorf("unknown message type: %v", msg.Type)
+        }
+
+        if err != nil {
+            log.Printf("Error handling message: %v", err)
+            return
+        }
+    }
 }
 
-func (t *TCPTransport) handleUploadFile(conn net.Conn) {
-	// Implement upload file logic
+func (t *TCPTransport) handleRegister(conn net.Conn, req *RegisterMessage) error {
+    // Assuming FileService interface is extended to include Register method
+    return t.handler.Register(context.Background(), req)
 }
 
-func (t *TCPTransport) handleDownloadFile(conn net.Conn) {
-	// Implement download file logic
+func (t *TCPTransport) handleUpload(conn net.Conn, req *UploadFileRequest) error {
+    stream := &tcpUploadStream{conn: conn}
+    return t.handler.UploadFile(context.Background(), req, func() UploadStream {
+        return stream
+    })
 }
 
-func (t *TCPTransport) handleDeleteFile(conn net.Conn) {
-	// Implement delete file logic
+func (t *TCPTransport) handleDownload(conn net.Conn, req *DownloadFileRequest) error {
+    stream := &tcpDownloadStream{conn: conn}
+    return t.handler.DownloadFile(context.Background(), req, stream)
 }
 
-func (t *TCPTransport) handleListFiles(conn net.Conn) {
-	// Implement list files logic
+func (t *TCPTransport) handleDelete(conn net.Conn, req *DeleteFileRequest) error {
+    resp, err := t.handler.DeleteFile(context.Background(), req)
+    if err != nil {
+        return err
+    }
+    return SendMessage(conn, &Message{
+        Type:           MessageType_DELETE,
+        DeleteResponse: resp,
+    })
 }
 
-// transport/transport.go
-
-type ChunkStream struct {
-	Chunks       []FileChunk
-	CurrentIndex int
+func (t *TCPTransport) handleList(conn net.Conn, req *ListFilesRequest) error {
+    resp, err := t.handler.ListFiles(context.Background(), req)
+    if err != nil {
+        return err
+    }
+    return SendMessage(conn, &Message{
+        Type:         MessageType_LIST,
+        ListResponse: resp,
+    })
 }
 
-func (cs *ChunkStream) Recv() (*FileChunk, error) {
-	if cs.CurrentIndex >= len(cs.Chunks) {
-		return nil, io.EOF
-	}
-	chunk := &cs.Chunks[cs.CurrentIndex]
-	cs.CurrentIndex++
-	return chunk, nil
+type tcpUploadStream struct {
+    conn net.Conn
 }
 
-func (cs *ChunkStream) Send(*FileChunk) error {
-	return nil // 이 메서드는 사용되지 않지만 인터페이스 구현을 위해 필요합니다
+func (s *tcpUploadStream) Send(chunk *FileChunk) error {
+    return SendMessage(s.conn, &Message{
+        Type:        MessageType_UPLOAD,
+        UploadChunk: chunk,
+    })
 }
 
-func (cs *ChunkStream) CloseAndRecv() (*UploadFileResponse, error) {
-	return &UploadFileResponse{Success: true}, nil
+func (s *tcpUploadStream) Recv() (*FileChunk, error) {
+    msg, err := ReceiveMessage(s.conn)
+    if err != nil {
+        return nil, err
+    }
+    if msg.Type != MessageType_UPLOAD {
+        return nil, fmt.Errorf("unexpected message type: %v", msg.Type)
+    }
+    return msg.UploadChunk, nil
+}
+
+func (s *tcpUploadStream) CloseAndRecv() (*UploadFileResponse, error) {
+    msg, err := ReceiveMessage(s.conn)
+    if err != nil {
+        return nil, err
+    }
+    if msg.Type != MessageType_UPLOAD {
+        return nil, fmt.Errorf("unexpected message type: %v", msg.Type)
+    }
+    return msg.UploadResponse, nil
+}
+
+type tcpDownloadStream struct {
+    conn net.Conn
+}
+
+func (s *tcpDownloadStream) Recv() (*FileChunk, error) {
+    msg, err := ReceiveMessage(s.conn)
+    if err != nil {
+        return nil, err
+    }
+    if msg.Type != MessageType_DOWNLOAD {
+        return nil, fmt.Errorf("unexpected message type: %v", msg.Type)
+    }
+    return msg.DownloadChunk, nil
 }

@@ -114,7 +114,7 @@ func TestDownload(t *testing.T) {
 	// 파일 다운로드
 	downloadStream := &transport.FileDownloadStream{}
 	err = master.DownloadFile(context.Background(), &transport.DownloadFileRequest{
-		UserId:   user_name,
+		UserID:   user_name,
 		Filename: file_name,
 	}, downloadStream)
 	if err != nil {
@@ -173,7 +173,7 @@ func TestFileDelete(t *testing.T) {
 
 	deleteResp, err := master.DeleteFile(context.Background(), &transport.DeleteFileRequest{
 		Filename: file_name,
-		UserId:   user_name,
+		UserID:   user_name,
 	})
 	if err != nil {
 		t.Fatalf("Failed to delete file: %v", err)

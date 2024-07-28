@@ -4,6 +4,7 @@ import (
 	policy "ChestyO/internal/enum"
 	"context"
 	"io"
+	"net"
 )
 
 // transport/transport.go
@@ -42,12 +43,12 @@ type UploadFileResponse struct {
 
 type DownloadFileRequest struct {
 	Filename string
-	UserId   string
+	UserID   string
 }
 
 type DeleteFileRequest struct {
 	Filename string
-	UserId   string
+	UserID   string
 }
 
 type DeleteFileResponse struct {
@@ -104,4 +105,12 @@ func (f *FileDownloadStream) Recv() (*FileChunk, error) {
 
 func (f *FileDownloadStream) AddChunk(data []byte) {
 	f.chunks = append(f.chunks, data)
+}
+
+type RegisterMessage struct{
+	NodeID string
+}
+
+type tcpUploadStream struct {
+    conn net.Conn
 }
