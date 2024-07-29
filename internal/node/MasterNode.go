@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type DataNodeInfo struct {
@@ -66,90 +67,135 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 }
 
 func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-    fmt.Printf("MasterNode: Starting file upload for %s\n", req.Filename)
+    log.Printf("MasterNode: Starting file upload for %s\n", req.Filename)
     mu := m.getUserMutex(req.UserID)
     mu.Lock()
     defer mu.Unlock()
 
     stream := createStream()
-    var fileContent []byte
-    for {
-        chunk, err := stream.Recv()
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            return fmt.Errorf("error receiving file chunk: %v", err)
-        }
-        fileContent = append(fileContent, chunk.Content...)
-    }
-
-    chunks := utils.SplitFileIntoChunks(fileContent)
-    fmt.Printf("MasterNode: File split into %d chunks\n", len(chunks))
-
     dataNodes := make([]*DataNodeInfo, 0, len(m.dataNodes))
     for _, node := range m.dataNodes {
         dataNodes = append(dataNodes, node)
     }
 
     m.fileLocations[req.Filename] = make([]string, 0)
-    // 각 노드에 청크 분배
-    for i, chunk := range chunks {
-        nodeIndex := i % len(dataNodes)
-        dataNode := dataNodes[nodeIndex]
+    chunkIndex := 0
 
-        uploadReq := &transport.UploadFileRequest{
-            Filename:  req.Filename,
-            ChunkName: fmt.Sprintf("%s_chunk_%d", req.Filename, i),
-            FileSize:  int64(len(chunk.Content)),
-            UserID:    req.UserID,
-        }
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+            chunk, err := stream.Recv()
+            if err != nil {
+                if err == io.EOF {
+                    log.Println("Received EOF, ending upload")
+                    break
+                }
+                log.Printf("Error receiving chunk: %v", err)
+                return fmt.Errorf("error receiving file chunk: %v", err)
+            }
 
-        msg := &transport.Message{
-            Type:          transport.MessageType_UPLOAD,
-            UploadRequest: uploadReq,
-        }
+            nodeIndex := chunkIndex % len(dataNodes)
+            dataNode := dataNodes[nodeIndex]
 
-        err := transport.SendMessage(dataNode.Conn, msg)
-        if err != nil {
-            return fmt.Errorf("failed to send upload request to node %s: %v", dataNode.ID, err)
-        }
+            err = m.sendChunkToDataNode(ctx, dataNode, req, chunk, chunkIndex)
+            if err != nil {
+                return fmt.Errorf("failed to send chunk to node %s: %v", dataNode.ID, err)
+            }
 
-        // Send the chunk
-        chunkMsg := &transport.Message{
-            Type:       transport.MessageType_UPLOAD,
-            // UploadChunk: &transport.FileChunk{Content: chunk.Content, Index: i},
-			ChunkRequest: &transport.FileChunk{
-				Content: chunk.Content,
-				Index: i,
-			},
-        }
-        err = transport.SendMessage(dataNode.Conn, chunkMsg)
-        if err != nil {
-            return fmt.Errorf("failed to send chunk to node %s: %v", dataNode.ID, err)
-        }
+            if !utils.Contains(m.fileLocations[req.Filename], dataNode.ID) {
+                m.fileLocations[req.Filename] = append(m.fileLocations[req.Filename], dataNode.ID)
+            }
 
-        // Receive response
-        respMsg, err := transport.ReceiveMessage(dataNode.Conn)
-        if err != nil {
-            return fmt.Errorf("failed to receive response from node %s: %v", dataNode.ID, err)
-        }
-
-        if respMsg.Type != transport.MessageType_UPLOAD  {
-            return fmt.Errorf("unexpected response from node %s", dataNode.ID)
-        }
-
-        // if !respMsg.UploadResponse.Success {
-        //     return fmt.Errorf("failed to upload chunk %d to node %s: %s", i, dataNode.ID, respMsg.UploadResponse.Message)
-        // }
-
-        if !utils.Contains(m.fileLocations[req.Filename], dataNode.ID) {
-            m.fileLocations[req.Filename] = append(m.fileLocations[req.Filename], dataNode.ID)
+            chunkIndex++
         }
     }
 
-    fmt.Printf("MasterNode: File upload completed for %s\n", req.Filename)
+    log.Printf("MasterNode: File upload completed for %s\n", req.Filename)
+
+    response, err := stream.CloseAndRecv()
+    if err != nil {
+        return fmt.Errorf("failed to send final response: %v", err)
+    }
+    if !response.Success {
+        return fmt.Errorf("upload failed: %s", response.Message)
+    }
+
     return nil
+}
+
+
+func (m *MasterNode) sendChunkToDataNode(ctx context.Context, dataNode *DataNodeInfo, req *transport.UploadFileRequest, chunk *transport.FileChunk, chunkIndex int) error {
+    log.Printf("MasterNode: Starting to send chunk %d to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+
+    uploadReq := &transport.UploadFileRequest{
+        Filename:  req.Filename,
+        ChunkName: fmt.Sprintf("%s_chunk_%d", req.Filename, chunkIndex),
+        FileSize:  int64(len(chunk.Content)),
+        UserID:    req.UserID,
+    }
+
+    msg := &transport.Message{
+        Type:          transport.MessageType_UPLOAD,
+        UploadRequest: uploadReq,
+    }
+
+    errChan := make(chan error, 1)
+    go func() {
+        log.Printf("MasterNode: Sending upload request for chunk %d to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+        err := transport.SendMessage(dataNode.Conn, msg)
+        if err != nil {
+            log.Printf("MasterNode: Error sending upload request for chunk %d to DataNode %s at %v: %v\n", chunkIndex, dataNode.ID, time.Now(), err)
+            errChan <- fmt.Errorf("failed to send upload request: %v", err)
+            return
+        }
+
+        log.Printf("MasterNode: Sending chunk %d data to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+        chunkMsg := &transport.Message{
+            Type:        transport.MessageType_UPLOAD,
+            UploadChunk: chunk,
+        }
+        err = transport.SendMessage(dataNode.Conn, chunkMsg)
+        if err != nil {
+            log.Printf("MasterNode: Error sending chunk %d data to DataNode %s at %v: %v\n", chunkIndex, dataNode.ID, time.Now(), err)
+            errChan <- fmt.Errorf("failed to send chunk: %v", err)
+            return
+        }
+
+        log.Printf("MasterNode: Waiting for response from DataNode %s for chunk %d at %v\n", dataNode.ID, chunkIndex, time.Now())
+        respMsg, err := transport.ReceiveMessage(dataNode.Conn)
+        if err != nil {
+            log.Printf("MasterNode: Error receiving response from DataNode %s for chunk %d at %v: %v\n", dataNode.ID, chunkIndex, time.Now(), err)
+            errChan <- fmt.Errorf("failed to receive response: %v", err)
+            return
+        }
+
+        if respMsg.Type != transport.MessageType_UPLOAD || respMsg.UploadResponse == nil || !respMsg.UploadResponse.Success {
+            log.Printf("MasterNode: Unexpected or failed response from DataNode %s for chunk %d at %v\n", dataNode.ID, chunkIndex, time.Now())
+            errChan <- fmt.Errorf("unexpected or failed response from node")
+            return
+        }
+
+        log.Printf("MasterNode: Successfully sent and received confirmation for chunk %d to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+        errChan <- nil
+    }()
+
+    select {
+    case err := <-errChan:
+        if err != nil {
+            log.Printf("MasterNode: Error sending chunk %d to DataNode %s at %v: %v\n", chunkIndex, dataNode.ID, time.Now(), err)
+        } else {
+            log.Printf("MasterNode: Successfully sent chunk %d to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+        }
+        return err
+    case <-ctx.Done():
+        log.Printf("MasterNode: Context cancelled while sending chunk %d to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+        return ctx.Err()
+    case <-time.After(10 * time.Second):
+        log.Printf("MasterNode: Timeout sending chunk %d to DataNode %s at %v\n", chunkIndex, dataNode.ID, time.Now())
+        return fmt.Errorf("timeout sending chunk to node %s", dataNode.ID)
+    }
 }
 
 func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {

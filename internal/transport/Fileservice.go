@@ -18,9 +18,9 @@ type FileService interface {
 
 // UploadStream represents a stream for uploading file chunks
 type UploadStream interface {
-	Send(*FileChunk) error
-	Recv() (*FileChunk, error)
-	CloseAndRecv() (*UploadFileResponse, error)
+    Send(*FileChunk) error
+    Recv() (*FileChunk, error)
+    CloseAndRecv() (*UploadFileResponse, error)
 }
 
 // DownloadStream represents a stream for downloading file chunks

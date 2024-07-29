@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type DataNode struct {
@@ -48,32 +49,53 @@ func (d *DataNode) Start(addr string, masterAddr string) error {
 // node/data.go
 
 func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-	fmt.Printf("DataNode %s: Starting file upload for %s\n", req.UserID, req.Filename)
+    log.Printf("DataNode %s: Starting file upload for %s at %v\n", d.ID, req.Filename, time.Now())
 
-	stream := createStream()
-	var totalWritten int64 = 0
-	chunkCount := 0
+    stream := createStream()
+    var totalWritten int64 = 0
+    chunkCount := 0
 
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("error receiving file chunk: %v", err)
-		}
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+            log.Printf("DataNode %s: Waiting to receive chunk for %s at %v\n", d.ID, req.Filename, time.Now())
+            chunk, err := stream.Recv()
+            if err == io.EOF {
+                log.Printf("DataNode %s: Received EOF for %s at %v\n", d.ID, req.Filename, time.Now())
+                break
+            }
+            if err != nil {
+                log.Printf("DataNode %s: Error receiving chunk for %s at %v: %v\n", d.ID, req.Filename, time.Now(), err)
+                return fmt.Errorf("error receiving file chunk: %v", err)
+            }
+            log.Printf("DataNode %s: Received chunk of size %d for %s at %v\n", d.ID, len(chunk.Content), req.Filename, time.Now())
 
-		n, err := d.store.Write(req.UserID, req.Filename, req.ChunkName, bytes.NewReader(chunk.Content))
-		if err != nil {
-			return fmt.Errorf("error writing file chunk: %v", err)
-		}
-		totalWritten += n
-		chunkCount++
-	}
+            writeStart := time.Now()
+            n, err := d.store.Write(req.UserID, req.Filename, req.ChunkName, bytes.NewReader(chunk.Content))
+            if err != nil {
+                log.Printf("DataNode %s: Error writing chunk for %s at %v: %v\n", d.ID, req.Filename, time.Now(), err)
+                return fmt.Errorf("error writing file chunk: %v", err)
+            }
+            log.Printf("DataNode %s: Wrote chunk of size %d for %s in %v\n", d.ID, n, req.Filename, time.Since(writeStart))
 
-	fmt.Printf("DataNode %s: File upload completed for %s. Wrote %d chunks, total size: %d\n", req.UserID, req.Filename, chunkCount, totalWritten)
-	return nil
+            totalWritten += n
+            chunkCount++
+        }
+    }
+
+    log.Printf("DataNode %s: File upload completed for %s. Wrote %d chunks, total size: %d at %v\n", d.ID, req.Filename, chunkCount, totalWritten, time.Now())
+
+    err := stream.Send(&transport.FileChunk{Content: nil, Index: -1}) // EOF 신호 전송
+    if err != nil {
+        log.Printf("DataNode %s: Error sending EOF signal for %s at %v: %v\n", d.ID, req.Filename, time.Now(), err)
+        return fmt.Errorf("error sending EOF signal: %v", err)
+    }
+
+    return nil
 }
+
 
 func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)

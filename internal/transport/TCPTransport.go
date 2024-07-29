@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 )
 
 type TCPTransport struct {
@@ -45,6 +46,7 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
     for {
         var msg Message
+        log.Printf("Attempting to decode message...")
         err := decoder.Decode(&msg)
         if err != nil {
             if err != io.EOF {
@@ -52,13 +54,15 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
             }
             return
         }
+        log.Printf("Successfully decoded message of type: %v", msg.Type)
 
-        ctx := context.Background()
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer cancel()
 
+        var respMsg *Message
         switch msg.Type {
         case MessageType_REGISTER:
-            // 등록 메시지 처리를 FileService 인터페이스를 통해 수행
-            err = t.handler.Register(ctx,conn, msg.RegisterMessage)
+            err = t.handler.Register(ctx, conn, msg.RegisterMessage)
         case MessageType_UPLOAD:
             err = t.handleUpload(ctx, conn, msg.UploadRequest)
         case MessageType_DOWNLOAD:
@@ -67,19 +71,19 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
             var resp *DeleteFileResponse
             resp, err = t.handler.DeleteFile(ctx, msg.DeleteRequest)
             if err == nil {
-                err = SendMessage(conn, &Message{
+                respMsg = &Message{
                     Type:           MessageType_DELETE,
                     DeleteResponse: resp,
-                })
+                }
             }
         case MessageType_LIST:
             var resp *ListFilesResponse
             resp, err = t.handler.ListFiles(ctx, msg.ListRequest)
             if err == nil {
-                err = SendMessage(conn, &Message{
+                respMsg = &Message{
                     Type:         MessageType_LIST,
                     ListResponse: resp,
-                })
+                }
             }
         default:
             err = fmt.Errorf("unknown message type: %v", msg.Type)
@@ -87,7 +91,21 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
         if err != nil {
             log.Printf("Error handling message: %v", err)
-            return
+            respMsg = &Message{
+                Type: msg.Type,
+                UploadResponse: &UploadFileResponse{
+                    Success: false,
+                    Message: err.Error(),
+                },
+            }
+        }
+
+        if respMsg != nil {
+            err = SendMessage(conn, respMsg)
+            if err != nil {
+                log.Printf("Error sending response: %v", err)
+                return
+            }
         }
     }
 }
@@ -123,21 +141,30 @@ func (s *tcpUploadStream) Send(chunk *FileChunk) error {
 }
 
 func (s *tcpUploadStream) Recv() (*FileChunk, error) {
-    var chunk FileChunk
-    err := s.decoder.Decode(&chunk)
+    s.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+    var msg Message
+    err := s.decoder.Decode(&msg)
+    s.conn.SetReadDeadline(time.Time{}) // 타임아웃 해제
     if err != nil {
         return nil, err
     }
-    return &chunk, nil
+    if msg.Type != MessageType_UPLOAD || msg.UploadChunk == nil {
+        return nil, fmt.Errorf("unexpected message type or nil chunk")
+    }
+    return msg.UploadChunk, nil
 }
 
+
 func (s *tcpUploadStream) CloseAndRecv() (*UploadFileResponse, error) {
-    var resp UploadFileResponse
-    err := s.decoder.Decode(&resp)
+    msg := &Message{}
+    err := s.decoder.Decode(msg)
     if err != nil {
         return nil, err
     }
-    return &resp, nil
+    if msg.Type != MessageType_UPLOAD || msg.UploadResponse == nil {
+        return nil, fmt.Errorf("unexpected message type or nil response")
+    }
+    return msg.UploadResponse, nil
 }
 
 type tcpDownloadStream struct {

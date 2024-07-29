@@ -125,3 +125,23 @@ type HasFileRequest struct {
 type HasFileResponse struct {
     Exists bool
 }
+
+func init() {
+    gob.Register(Message{})
+    gob.Register(RegisterMessage{})
+    gob.Register(UploadFileRequest{})
+    gob.Register(DownloadFileRequest{})
+    gob.Register(DeleteFileRequest{})
+    gob.Register(ListFilesRequest{})
+    gob.Register(FileChunk{})
+    gob.Register(UploadFileResponse{})
+    gob.Register(DownloadFileResponse{})
+    gob.Register(DeleteFileResponse{})
+    gob.Register(ListFilesResponse{})
+    gob.Register(FileInfo{})
+    gob.Register(policy.UploadPolicy(0))
+    gob.Register(FileDownloadStream{})
+    gob.Register(FileMetadata{})
+    gob.Register(HasFileRequest{})
+    gob.Register(HasFileResponse{})
+}
