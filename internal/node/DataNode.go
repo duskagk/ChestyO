@@ -30,6 +30,21 @@ func NewDataNode(id string, storeOpts store.StoreOpts) *DataNode {
 	}
 }
 
+
+func (d *DataNode) Start(addr string, masterAddr string) error {
+    if err := d.RegisterWithMaster(masterAddr); err != nil {
+        return fmt.Errorf("failed to register with master: %v", err)
+    }
+
+    transport, err := transport.NewTCPTransport(addr, d)
+    if err != nil {
+        return fmt.Errorf("failed to set up TCP transport: %v", err)
+    }
+
+    log.Printf("Data node %s running on %s, connected to master %s", d.ID, addr, masterAddr)
+    return transport.Serve()
+}
+
 // node/data.go
 
 func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
@@ -60,24 +75,13 @@ func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequ
 	return nil
 }
 
-func (d *DataNode) HasFile(userId, filename string) bool {
+func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)
 }
 
 func RunDataNode(id, addr, masterAddr string) error {
     dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("/tmp/datanode_%s", id)})
-    
-    if err := dataNode.RegisterWithMaster(masterAddr); err != nil {
-        return fmt.Errorf("failed to register with master: %v", err)
-    }
-
-    transport, err := transport.NewTCPTransport(addr, dataNode)
-    if err != nil {
-        return fmt.Errorf("failed to set up TCP transport: %v", err)
-    }
-
-    log.Printf("Data node %s running on %s, connected to master %s", id, addr, masterAddr)
-    return transport.Serve()
+    return dataNode.Start(addr, masterAddr)
 }
 
 // DownloadFile downloads a file from the distributed system
@@ -231,7 +235,6 @@ func (d *DataNode) RegisterWithMaster(masterAddr string) error {
     }
     d.masterConn = conn
 
-    // Send registration message
     msg := &transport.Message{
         Type: transport.MessageType_REGISTER,
         RegisterMessage: &transport.RegisterMessage{
@@ -239,4 +242,8 @@ func (d *DataNode) RegisterWithMaster(masterAddr string) error {
         },
     }
     return transport.SendMessage(conn, msg)
+}
+
+func (m *DataNode) Register(ctx context.Context,conn net.Conn, req *transport.RegisterMessage) error {
+    return nil
 }

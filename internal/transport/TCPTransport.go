@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"log"
@@ -40,8 +41,11 @@ func (t *TCPTransport) Close() error {
 
 func (t *TCPTransport) handleConnection(conn net.Conn) {
     defer conn.Close()
+    decoder := gob.NewDecoder(conn)
+
     for {
-        msg, err := ReceiveMessage(conn)
+        var msg Message
+        err := decoder.Decode(&msg)
         if err != nil {
             if err != io.EOF {
                 log.Printf("Error receiving message: %v", err)
@@ -49,17 +53,34 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
             return
         }
 
+        ctx := context.Background()
+
         switch msg.Type {
         case MessageType_REGISTER:
-            err = t.handleRegister(conn, msg.RegisterMessage)
+            // 등록 메시지 처리를 FileService 인터페이스를 통해 수행
+            err = t.handler.Register(ctx,conn, msg.RegisterMessage)
         case MessageType_UPLOAD:
-            err = t.handleUpload(conn, msg.UploadRequest)
+            err = t.handleUpload(ctx, conn, msg.UploadRequest)
         case MessageType_DOWNLOAD:
-            err = t.handleDownload(conn, msg.DownloadRequest)
+            err = t.handleDownload(ctx, conn, msg.DownloadRequest)
         case MessageType_DELETE:
-            err = t.handleDelete(conn, msg.DeleteRequest)
+            var resp *DeleteFileResponse
+            resp, err = t.handler.DeleteFile(ctx, msg.DeleteRequest)
+            if err == nil {
+                err = SendMessage(conn, &Message{
+                    Type:           MessageType_DELETE,
+                    DeleteResponse: resp,
+                })
+            }
         case MessageType_LIST:
-            err = t.handleList(conn, msg.ListRequest)
+            var resp *ListFilesResponse
+            resp, err = t.handler.ListFiles(ctx, msg.ListRequest)
+            if err == nil {
+                err = SendMessage(conn, &Message{
+                    Type:         MessageType_LIST,
+                    ListResponse: resp,
+                })
+            }
         default:
             err = fmt.Errorf("unknown message type: %v", msg.Type)
         }
@@ -71,89 +92,69 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
     }
 }
 
-func (t *TCPTransport) handleRegister(conn net.Conn, req *RegisterMessage) error {
-    // Assuming FileService interface is extended to include Register method
-    return t.handler.Register(context.Background(), req)
-}
-
-func (t *TCPTransport) handleUpload(conn net.Conn, req *UploadFileRequest) error {
-    stream := &tcpUploadStream{conn: conn}
-    return t.handler.UploadFile(context.Background(), req, func() UploadStream {
+func (t *TCPTransport) handleUpload(ctx context.Context, conn net.Conn, req *UploadFileRequest) error {
+    stream := &tcpUploadStream{
+        conn:    conn,
+        decoder: gob.NewDecoder(conn),
+        encoder: gob.NewEncoder(conn),
+    }
+    return t.handler.UploadFile(ctx, req, func() UploadStream {
         return stream
     })
 }
 
-func (t *TCPTransport) handleDownload(conn net.Conn, req *DownloadFileRequest) error {
-    stream := &tcpDownloadStream{conn: conn}
-    return t.handler.DownloadFile(context.Background(), req, stream)
-}
-
-func (t *TCPTransport) handleDelete(conn net.Conn, req *DeleteFileRequest) error {
-    resp, err := t.handler.DeleteFile(context.Background(), req)
-    if err != nil {
-        return err
+func (t *TCPTransport) handleDownload(ctx context.Context, conn net.Conn, req *DownloadFileRequest) error {
+    stream := &tcpDownloadStream{
+        conn:    conn,
+        decoder: gob.NewDecoder(conn),
+        encoder: gob.NewEncoder(conn),
     }
-    return SendMessage(conn, &Message{
-        Type:           MessageType_DELETE,
-        DeleteResponse: resp,
-    })
-}
-
-func (t *TCPTransport) handleList(conn net.Conn, req *ListFilesRequest) error {
-    resp, err := t.handler.ListFiles(context.Background(), req)
-    if err != nil {
-        return err
-    }
-    return SendMessage(conn, &Message{
-        Type:         MessageType_LIST,
-        ListResponse: resp,
-    })
+    return t.handler.DownloadFile(ctx, req, stream)
 }
 
 type tcpUploadStream struct {
-    conn net.Conn
+    conn    net.Conn
+    decoder *gob.Decoder
+    encoder *gob.Encoder
 }
 
 func (s *tcpUploadStream) Send(chunk *FileChunk) error {
-    return SendMessage(s.conn, &Message{
-        Type:        MessageType_UPLOAD,
-        UploadChunk: chunk,
-    })
+    return s.encoder.Encode(chunk)
 }
 
 func (s *tcpUploadStream) Recv() (*FileChunk, error) {
-    msg, err := ReceiveMessage(s.conn)
+    var chunk FileChunk
+    err := s.decoder.Decode(&chunk)
     if err != nil {
         return nil, err
     }
-    if msg.Type != MessageType_UPLOAD {
-        return nil, fmt.Errorf("unexpected message type: %v", msg.Type)
-    }
-    return msg.UploadChunk, nil
+    return &chunk, nil
 }
 
 func (s *tcpUploadStream) CloseAndRecv() (*UploadFileResponse, error) {
-    msg, err := ReceiveMessage(s.conn)
+    var resp UploadFileResponse
+    err := s.decoder.Decode(&resp)
     if err != nil {
         return nil, err
     }
-    if msg.Type != MessageType_UPLOAD {
-        return nil, fmt.Errorf("unexpected message type: %v", msg.Type)
-    }
-    return msg.UploadResponse, nil
+    return &resp, nil
 }
 
 type tcpDownloadStream struct {
-    conn net.Conn
+    conn    net.Conn
+    decoder *gob.Decoder
+    encoder *gob.Encoder
 }
 
 func (s *tcpDownloadStream) Recv() (*FileChunk, error) {
-    msg, err := ReceiveMessage(s.conn)
+    var chunk FileChunk
+    err := s.decoder.Decode(&chunk)
     if err != nil {
         return nil, err
     }
-    if msg.Type != MessageType_DOWNLOAD {
-        return nil, fmt.Errorf("unexpected message type: %v", msg.Type)
-    }
-    return msg.DownloadChunk, nil
+    return &chunk, nil
+}
+
+func (s *tcpDownloadStream) Send(chunk *FileChunk) error {
+    return s.encoder.Encode(chunk)
 }
