@@ -13,6 +13,7 @@ import (
 type TCPTransport struct {
     listener net.Listener
     handler  FileService
+    stopChan chan struct{}
 }
 
 func NewTCPTransport(address string, handler FileService) (*TCPTransport, error) {
@@ -23,24 +24,37 @@ func NewTCPTransport(address string, handler FileService) (*TCPTransport, error)
     return &TCPTransport{
         listener: listener,
         handler:  handler,
+        stopChan: make(chan struct{}),
     }, nil
 }
 
-func (t *TCPTransport) Serve() error {
+func (t *TCPTransport) Serve(ctx context.Context) error {
     for {
-        conn, err := t.listener.Accept()
-        if err != nil {
-            return err
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-t.stopChan:
+            return nil
+        default:
+            conn, err := t.listener.Accept()
+            if err != nil {
+                if ne, ok := err.(net.Error); ok && ne.Temporary() {
+                    time.Sleep(time.Second)
+                    continue
+                }
+                return err
+            }
+            go t.handleConnection(ctx, conn)
         }
-        go t.handleConnection(conn)
     }
 }
 
 func (t *TCPTransport) Close() error {
+    close(t.stopChan)
     return t.listener.Close()
 }
 
-func (t *TCPTransport) handleConnection(conn net.Conn) {
+func (t *TCPTransport) handleConnection(ctx context.Context, conn net.Conn) {
     defer conn.Close()
     decoder := gob.NewDecoder(conn)
     encoder := gob.NewEncoder(conn)
@@ -48,38 +62,77 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
     var uploadStream UploadStream
 
     for {
-        var msg Message
-        log.Printf("Attempting to decode message...")
-        err := decoder.Decode(&msg)
-        if err != nil {
-            if err != io.EOF {
-                log.Printf("TCP : Error receiving message: %v %v", err, msg)
-            }
+        select {
+        case <-ctx.Done():
+            log.Printf("Context cancelled, closing connection")
             return
-        }
-        log.Printf("Successfully decoded message of type: %v", msg.Type)
-
-        ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-        defer cancel()
-
-        var respMsg *Message
-        switch msg.Type {
-        case MessageType_REGISTER:
-            err = t.handler.Register(ctx,msg.RegisterMessage)
-        case MessageType_UPLOAD:
-            if msg.UploadRequest != nil {
-                currentUploadRequest = msg.UploadRequest
-                uploadStream = &tcpUploadStream{
-                    conn:    conn,
-                    decoder: decoder,
-                    encoder: encoder,
+        default:
+            var msg Message
+            log.Printf("Attempting to decode message...\n")
+            err := decoder.Decode(&msg)
+            if err != nil {
+                if err != io.EOF {
+                    log.Printf("TCP : Error receiving message: %v %v", err, msg)
                 }
-                err = t.handler.UploadFile(ctx, currentUploadRequest, func() UploadStream {
-                    return uploadStream
-                })
-            } else if msg.UploadChunk != nil && currentUploadRequest != nil {
-                // Handle chunk upload
-                err = uploadStream.Send(msg.UploadChunk)
+                return
+            }
+            log.Printf("Successfully decoded message of type: %v", msg.Type)
+
+            operationCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+            defer cancel()
+
+            var respMsg *Message
+            switch msg.Type {
+            case MessageType_REGISTER:
+                err = t.handler.Register(operationCtx, msg.RegisterMessage)
+            case MessageType_UPLOAD:
+                if msg.UploadRequest != nil {
+                    currentUploadRequest = msg.UploadRequest
+                    uploadStream = &tcpUploadStream{
+                        conn:    conn,
+                        decoder: decoder,
+                        encoder: encoder,
+                    }
+                    err = t.handler.UploadFile(operationCtx, currentUploadRequest, func() UploadStream {
+                        return uploadStream
+                    })
+                } else if msg.UploadChunk != nil && currentUploadRequest != nil {
+                    err = uploadStream.Send(msg.UploadChunk)
+                    if err == nil {
+                        respMsg = &Message{
+                            Type: MessageType_UPLOAD_CHUNK_RESPONSE,
+                            UploadChunkResponse: &UploadChunkResponse{
+                                Success: true,
+                                Message: fmt.Sprintf("Chunk %d received successfully", msg.UploadChunk.Chunk.Index),
+                                ChunkIndex: msg.UploadChunk.Chunk.Index,
+                            },
+                        }
+                    }
+                } else {
+                    err = fmt.Errorf("invalid upload message or no active upload")
+                }
+            case MessageType_DOWNLOAD:
+                err = t.handleDownload(operationCtx, conn, msg.DownloadRequest)
+            case MessageType_DELETE:
+                var resp *DeleteFileResponse
+                resp, err = t.handler.DeleteFile(operationCtx, msg.DeleteRequest)
+                if err == nil {
+                    respMsg = &Message{
+                        Type:           MessageType_DELETE,
+                        DeleteResponse: resp,
+                    }
+                }
+            case MessageType_LIST:
+                var resp *ListFilesResponse
+                resp, err = t.handler.ListFiles(operationCtx, msg.ListRequest)
+                if err == nil {
+                    respMsg = &Message{
+                        Type:         MessageType_LIST,
+                        ListResponse: resp,
+                    }
+                }
+            case MessageType_UPLOAD_CHUNK:
+                err = t.handler.UploadFileChunk(operationCtx, msg.UploadChunk)
                 if err == nil {
                     respMsg = &Message{
                         Type: MessageType_UPLOAD_CHUNK_RESPONSE,
@@ -90,75 +143,42 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
                         },
                     }
                 }
-            } else {
-                err = fmt.Errorf("invalid upload message or no active upload")
-            }
-        case MessageType_DOWNLOAD:
-            err = t.handleDownload(ctx, conn, msg.DownloadRequest)
-        case MessageType_DELETE:
-            var resp *DeleteFileResponse
-            resp, err = t.handler.DeleteFile(ctx, msg.DeleteRequest)
-            if err == nil {
-                respMsg = &Message{
-                    Type:           MessageType_DELETE,
-                    DeleteResponse: resp,
+            case MessageType_UPLOAD_CHUNK_RESPONSE:
+                if msg.UploadChunkResponse != nil {
+                    log.Printf("Received chunk upload response for index %d: %s", 
+                    msg.UploadChunkResponse.ChunkIndex, 
+                    msg.UploadChunkResponse.Message)
                 }
+            default:
+                err = fmt.Errorf("unknown message type: %v", msg.Type)
             }
-        case MessageType_LIST:
-            var resp *ListFilesResponse
-            resp, err = t.handler.ListFiles(ctx, msg.ListRequest)
-            if err == nil {
+
+            if err != nil {
+                log.Printf("Error handling message: %v", err)
                 respMsg = &Message{
-                    Type:         MessageType_LIST,
-                    ListResponse: resp,
-                }
-            }
-        case MessageType_UPLOAD_CHUNK:
-            err = t.handler.UploadFileChunk(ctx, msg.UploadChunk)
-            if err == nil {
-                respMsg = &Message{
-                    Type: MessageType_UPLOAD_CHUNK_RESPONSE,
-                    UploadChunkResponse: &UploadChunkResponse{
-                        Success: true,
-                        Message: fmt.Sprintf("Chunk %d received successfully", msg.UploadChunk.Chunk.Index),
-                        ChunkIndex: msg.UploadChunk.Chunk.Index,
+                    Type: msg.Type,
+                    UploadResponse: &UploadFileResponse{
+                        Success: false,
+                        Message: err.Error(),
                     },
                 }
             }
-        case MessageType_UPLOAD_CHUNK_RESPONSE:
-            if msg.UploadChunkResponse !=nil{
-                log.Printf("Received chunk upload response for index %d: %s", 
-                msg.UploadChunkResponse.ChunkIndex, 
-                msg.UploadChunkResponse.Message)
-            }
-        default:
-            err = fmt.Errorf("unknown message type: %v", msg.Type)
-        }
 
-        if err != nil {
-            log.Printf("Error handling message: %v", err)
-            respMsg = &Message{
-                Type: msg.Type,
-                UploadResponse: &UploadFileResponse{
-                    Success: false,
-                    Message: err.Error(),
-                },
-            }
-        }
+            fmt.Print(respMsg)
+            // if respMsg != nil {
+            //     log.Printf("TCP : SendMessage %v", respMsg)
+            //     err = SendMessage(conn, respMsg)
+            //     if err != nil {
+            //         log.Printf("Error sending response: %v", err)
+            //         return
+            //     }
+            // }
 
-        if respMsg != nil {
-            log.Printf("TCP : SendMessage %v",respMsg)
-            err = SendMessage(conn, respMsg)
-            if err != nil {
-                log.Printf("Error sending response: %v", err)
-                return
+            // Reset upload state if the upload is completed or an error occurred
+            if msg.Type != MessageType_UPLOAD || err != nil {
+                currentUploadRequest = nil
+                uploadStream = nil
             }
-        }
-
-        // Reset upload state if the upload is completed or an error occurred
-        if msg.Type != MessageType_UPLOAD || err != nil {
-            currentUploadRequest = nil
-            uploadStream = nil
         }
     }
 }

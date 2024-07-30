@@ -21,18 +21,20 @@ type DataNode struct {
     ID         string
     store      *store.Store
     masterConn net.Conn
+	stopChan chan struct{}
 }
 
 func NewDataNode(id string, storeOpts store.StoreOpts) *DataNode {
 	return &DataNode{
 		ID:    id,
 		store: store.NewStore(storeOpts),
+		stopChan: make(chan struct{}),
 	}
 }
 
 
-func (d *DataNode) Start(addr string, masterAddr string) error {
-    if err := d.RegisterWithMaster(addr,masterAddr); err != nil {
+func (d *DataNode) Start(ctx context.Context,addr string, masterAddr string) error {
+    if err := d.RegisterWithMaster(addr, masterAddr); err != nil {
         return fmt.Errorf("failed to register with master: %v", err)
     }
 
@@ -41,9 +43,23 @@ func (d *DataNode) Start(addr string, masterAddr string) error {
         return fmt.Errorf("failed to set up TCP transport: %v", err)
     }
 
-    log.Printf("Data node %s running on %s, connected to master %s", d.ID, addr, masterAddr)
+    errChan := make(chan error, 1)
+    go func() {
+        errChan <- transport.Serve(ctx)
+    }()
 
-    return transport.Serve()
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case <-d.stopChan:
+        return nil
+    case err := <-errChan:
+        return err
+    }
+}
+
+func (d * DataNode) Stop(){
+	close(d.stopChan)
 }
 
 // node/data.go
@@ -56,9 +72,9 @@ func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)
 }
 
-func RunDataNode(id, addr, masterAddr string) error {
-    dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("/tmp/datanode_%s", id)})
-    return dataNode.Start(addr, masterAddr)
+func RunDataNode(ctx context.Context,id, addr, masterAddr string) error {
+    dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("./tmp/datanode_%s", id)})
+    return dataNode.Start(ctx,addr, masterAddr)
 }
 
 // DownloadFile downloads a file from the distributed system

@@ -29,6 +29,7 @@ type MasterNode struct {
     userMutexes   sync.Map
     transport     *transport.TCPTransport
     mu            sync.RWMutex
+    stopChan      chan struct{}
 }
 
 func NewMasterNode(id string) *MasterNode {
@@ -37,11 +38,11 @@ func NewMasterNode(id string) *MasterNode {
 		dataNodes:     make(map[string]*DataNodeInfo),
 		fileLocations: make(map[string][]string),
 		userMutexes: sync.Map{},
+        stopChan: make(chan struct{}),
 	}
 }
 
 func (m *MasterNode) HasFile(ctx context.Context,userId, filename string) (bool) {
-
 	// resultChan := make(chan (bool))
 	// go m.hasFileAsync(ctx,userId, filename, resultChan)
 	return false
@@ -125,8 +126,10 @@ func (m *MasterNode) sendChunkToDataNode(ctx context.Context, dataNode *DataNode
     }()
 
     select {
+    case <-ctx.Done():
+        return ctx.Err()
     case respMsg := <-respChan:
-        log.Printf("MasterNode: Received response from DataNode %s: \n", dataNode.ID)
+        log.Printf("MasterNode: Received response from DataNode %s: %+v\n", dataNode.ID, respMsg)
         
         // respMsg 처리
         if respMsg.Type != transport.MessageType_UPLOAD_CHUNK_RESPONSE {
@@ -152,7 +155,7 @@ func (m *MasterNode) sendChunkToDataNode(ctx context.Context, dataNode *DataNode
         log.Printf("MasterNode: Error receiving response from DataNode %s: %v\n", dataNode.ID, err)
         return err
 
-    case <-time.After(10 * time.Second):
+    case <-time.After(10 * time.Second):  // 타임아웃 시간을 30초로 증가
         log.Printf("MasterNode: Timeout waiting for response from DataNode %s\n", dataNode.ID)
         return fmt.Errorf("timeout waiting for response")
     }
@@ -251,29 +254,40 @@ func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequ
 	return nil, nil
 }
 
-func (m *MasterNode) Start(addr string) error {
+func (m *MasterNode) Start(ctx context.Context,addr string) error {
     transport, err := transport.NewTCPTransport(addr, m)
     if err != nil {
         return fmt.Errorf("failed to set up TCP transport: %v", err)
     }
     m.transport = transport
 
-    log.Printf("Master node %s running on %s", m.ID, addr)
-    return m.transport.Serve()
+    errChan := make(chan error, 1)
+    go func() {
+        errChan <- m.transport.Serve(ctx)
+    }()
+
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    case <-m.stopChan:
+        return nil
+    case err := <-errChan:
+        return err
+    }
 }
 
 func (m *MasterNode) Stop() {
-	if m.transport != nil {
-		m.transport.Close()
-	}
+    close(m.stopChan)
+    if m.transport != nil {
+        m.transport.Close()
+    }
 }
 
 
-func RunMasterNode(id, addr string) error {
+func RunMasterNode(ctx context.Context, id, addr string) error {
     master := NewMasterNode(id)
-    return master.Start(addr)
+    return master.Start(ctx, addr)
 }
-
 
 
 func (m *MasterNode) hasFileAsync(ctx context.Context,userId, filename string, resultChan chan<- (bool)) {
@@ -412,22 +426,31 @@ func (m *MasterNode) distributeChunks(chunks []transport.FileChunk, nodes []*Dat
     return distribution
 }
 
-func (m *MasterNode) uploadChunksToDataNodes(ctx context.Context, req *transport.UploadFileRequest, distribution map[*DataNodeInfo][]transport.FileChunk) error {
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(distribution))
+func (m *MasterNode) uploadChunksToDataNodes(ctx context.Context, req *transport.UploadFileRequest, chunkDistribution map[*DataNodeInfo][]transport.FileChunk) error {
+    log.Printf("MasterNode: Starting to upload chunks for file %s", req.Filename)
 
-    for node, chunks := range distribution {
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(chunkDistribution))
+
+    for dataNode, chunks := range chunkDistribution {
         wg.Add(1)
-        go func(node *DataNodeInfo, chunks []transport.FileChunk) {
+        go func(node *DataNodeInfo, nodeChunks []transport.FileChunk) {
             defer wg.Done()
-            for _,chunk := range chunks {
-                err := m.sendChunkToDataNode(ctx, node, req, &chunk)
-                if err != nil {
-                    errChan <- fmt.Errorf("failed to send chunk to DataNode %s: %v", node.ID, err)
+            for _, chunk := range nodeChunks {
+                select {
+                case <-ctx.Done():
+                    errChan <- ctx.Err()
                     return
+                default:
+                    err := m.sendChunkToDataNode(ctx, node, req, &chunk)
+                    if err != nil {
+                        errChan <- fmt.Errorf("failed to send chunk %d to DataNode %s: %v", chunk.Index, node.ID, err)
+                        return
+                    }
+                    log.Printf("MasterNode: Successfully sent and processed chunk %d for DataNode %s", chunk.Index, node.ID)
                 }
             }
-        }(node, chunks)
+        }(dataNode, chunks)
     }
 
     go func() {
@@ -437,13 +460,21 @@ func (m *MasterNode) uploadChunksToDataNodes(ctx context.Context, req *transport
 
     for err := range errChan {
         if err != nil {
+            log.Printf("MasterNode: Error during chunk upload: %v", err)
             return err
         }
     }
 
+    log.Printf("MasterNode: All chunks uploaded successfully for file %s", req.Filename)
     return nil
 }
 
 func (m *MasterNode) UploadFileChunk(ctx context.Context, chunk *transport.UploadFileChunk) error{
     return nil
+}
+
+func (m *MasterNode) GetConnectedDataNodesCount() int {
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+    return len(m.dataNodes)
 }

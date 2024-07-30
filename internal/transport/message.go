@@ -38,6 +38,7 @@ type Message struct {
 
 
 func SendMessage(conn net.Conn, msg *Message) error {
+    log.Printf("SendMessage : %v\n",msg)
     encoder := gob.NewEncoder(conn)
     err := encoder.Encode(msg)
     if err != nil {
