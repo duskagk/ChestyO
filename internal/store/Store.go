@@ -105,6 +105,15 @@ func (s *Store) Write(id string, originalFilename string, chunkName string, r io
 	return s.writeStream(id, originalFilename, chunkName, r)
 }
 
+func (s *Store) writeStream(id string, originalFilename string, chunkName string, r io.Reader) (int64, error) {
+	f, err := s.openFileForWriting(id, originalFilename, chunkName)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return io.Copy(f, r)
+}
+
 // func (s *Store) WriteDecrypt(encKey []byte,id string, key string, r io.Reader)(int64, error){
 // 	f,err := s.openFileForWriting(id,key)
 // 	if err != nil{
@@ -126,14 +135,7 @@ func (s *Store) openFileForWriting(id string, originalFilename string, chunkName
 	return os.Create(fullPath)
 }
 
-func (s *Store) writeStream(id string, originalFilename string, chunkName string, r io.Reader) (int64, error) {
-	f, err := s.openFileForWriting(id, originalFilename, chunkName)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	return io.Copy(f, r)
-}
+
 
 func (s *Store) Read(id string, originalFilename string, chunkName string) (int64, io.Reader, error) {
 	return s.readStream(id, originalFilename, chunkName)

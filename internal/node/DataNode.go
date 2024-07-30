@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type DataNode struct {
@@ -33,7 +32,7 @@ func NewDataNode(id string, storeOpts store.StoreOpts) *DataNode {
 
 
 func (d *DataNode) Start(addr string, masterAddr string) error {
-    if err := d.RegisterWithMaster(masterAddr); err != nil {
+    if err := d.RegisterWithMaster(addr,masterAddr); err != nil {
         return fmt.Errorf("failed to register with master: %v", err)
     }
 
@@ -43,59 +42,15 @@ func (d *DataNode) Start(addr string, masterAddr string) error {
     }
 
     log.Printf("Data node %s running on %s, connected to master %s", d.ID, addr, masterAddr)
+
     return transport.Serve()
 }
 
 // node/data.go
-
 func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-    log.Printf("DataNode %s: Starting file upload for %s at %v\n", d.ID, req.Filename, time.Now())
 
-    stream := createStream()
-    var totalWritten int64 = 0
-    chunkCount := 0
-
-    for {
-        select {
-        case <-ctx.Done():
-            return ctx.Err()
-        default:
-            log.Printf("DataNode %s: Waiting to receive chunk for %s at %v\n", d.ID, req.Filename, time.Now())
-            chunk, err := stream.Recv()
-            if err == io.EOF {
-                log.Printf("DataNode %s: Received EOF for %s at %v\n", d.ID, req.Filename, time.Now())
-                break
-            }
-            if err != nil {
-                log.Printf("DataNode %s: Error receiving chunk for %s at %v: %v\n", d.ID, req.Filename, time.Now(), err)
-                return fmt.Errorf("error receiving file chunk: %v", err)
-            }
-            log.Printf("DataNode %s: Received chunk of size %d for %s at %v\n", d.ID, len(chunk.Content), req.Filename, time.Now())
-
-            writeStart := time.Now()
-            n, err := d.store.Write(req.UserID, req.Filename, req.ChunkName, bytes.NewReader(chunk.Content))
-            if err != nil {
-                log.Printf("DataNode %s: Error writing chunk for %s at %v: %v\n", d.ID, req.Filename, time.Now(), err)
-                return fmt.Errorf("error writing file chunk: %v", err)
-            }
-            log.Printf("DataNode %s: Wrote chunk of size %d for %s in %v\n", d.ID, n, req.Filename, time.Since(writeStart))
-
-            totalWritten += n
-            chunkCount++
-        }
-    }
-
-    log.Printf("DataNode %s: File upload completed for %s. Wrote %d chunks, total size: %d at %v\n", d.ID, req.Filename, chunkCount, totalWritten, time.Now())
-
-    err := stream.Send(&transport.FileChunk{Content: nil, Index: -1}) // EOF 신호 전송
-    if err != nil {
-        log.Printf("DataNode %s: Error sending EOF signal for %s at %v: %v\n", d.ID, req.Filename, time.Now(), err)
-        return fmt.Errorf("error sending EOF signal: %v", err)
-    }
-
-    return nil
+	return nil;
 }
-
 
 func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)
@@ -250,7 +205,7 @@ func (d *DataNode) ReadChunk(userId, filename, chunkName string) ([]byte, error)
 }
 
 
-func (d *DataNode) RegisterWithMaster(masterAddr string) error {
+func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
     conn, err := net.Dial("tcp", masterAddr)
     if err != nil {
         return err
@@ -261,11 +216,32 @@ func (d *DataNode) RegisterWithMaster(masterAddr string) error {
         Type: transport.MessageType_REGISTER,
         RegisterMessage: &transport.RegisterMessage{
             NodeID: d.ID,
+            Addr:   addr,
         },
     }
     return transport.SendMessage(conn, msg)
 }
 
-func (m *DataNode) Register(ctx context.Context,conn net.Conn, req *transport.RegisterMessage) error {
+func (m *DataNode) Register(ctx context.Context,req *transport.RegisterMessage) error {
     return nil
+}
+
+
+func (d *DataNode) UploadFileChunk(ctx context.Context, req *transport.UploadFileChunk) error{
+	log.Printf("%v : data receive",d.ID)
+
+	chunk_file_name := fmt.Sprintf("%s_chunk_%d", req.Filename, req.Chunk.Index)
+	d.store.Write(req.UserID,req.Filename,chunk_file_name,bytes.NewReader(req.Chunk.Content))
+	
+
+    // respMsg := &transport.Message{
+    //     Type: transport.MessageType_UPLOAD_CHUNK_RESPONSE,
+    //     UploadChunkResponse: &transport.UploadChunkResponse{
+    //         Success: true,
+    //         Message: fmt.Sprintf("Chunk %d received successfully", req.Chunk.Index),
+    //         ChunkIndex: req.Chunk.Index,
+    //     },
+    // }
+    return nil
+
 }

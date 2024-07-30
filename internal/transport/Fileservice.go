@@ -3,14 +3,14 @@ package transport
 import (
 	"context"
 	"io"
-	"net"
 )
 
 // transport/transport.go
 type FileService interface {
-	Register(ctx context.Context,conn net.Conn, req *RegisterMessage) error
+	Register(ctx context.Context, req *RegisterMessage) error
     UploadFile(ctx context.Context, req *UploadFileRequest, createStream func() UploadStream) error
-    DownloadFile(ctx context.Context, req *DownloadFileRequest, stream DownloadStream) error
+    UploadFileChunk(ctx context.Context, chunk *UploadFileChunk) error
+	DownloadFile(ctx context.Context, req *DownloadFileRequest, stream DownloadStream) error
     DeleteFile(ctx context.Context, req *DeleteFileRequest) (*DeleteFileResponse, error)
     ListFiles(ctx context.Context, req *ListFilesRequest) (*ListFilesResponse, error)
     HasFile(ctx context.Context, userID, filename string) bool
@@ -18,8 +18,8 @@ type FileService interface {
 
 // UploadStream represents a stream for uploading file chunks
 type UploadStream interface {
-    Send(*FileChunk) error
-    Recv() (*FileChunk, error)
+    Send(*UploadFileChunk) error
+    Recv() (*UploadFileChunk, error)
     CloseAndRecv() (*UploadFileResponse, error)
 }
 

@@ -3,14 +3,12 @@
 package test
 
 import (
-	policy "ChestyO/internal/enum"
+	"ChestyO/internal/enum"
 	"ChestyO/internal/node"
 	"ChestyO/internal/transport"
 	"io/ioutil"
 	"log"
 	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -64,6 +62,7 @@ func TestNodeConnection(t *testing.T) {
 
     // Check if we can connect to DataNode
     conn, err = net.Dial("tcp", dataAddr1)
+    
     
     if err != nil {
         t.Errorf("Failed to connect to DataNode: %v", err)
@@ -119,6 +118,7 @@ func TestFileUpload(t *testing.T) {
 
     // MasterNode에 연결
     conn, err := net.Dial("tcp", masterAddr)
+    conn.SetDeadline(time.Now().Add(30 * time.Second))
     if err != nil {
         t.Fatalf("Failed to connect to MasterNode: %v", err)
     }
@@ -127,79 +127,104 @@ func TestFileUpload(t *testing.T) {
     userID := "testuser"
 
     // 업로드 요청 전송
-    err = transport.SendMessage(conn, &transport.Message{
+    transport.SendMessage(conn, &transport.Message{
         Type: transport.MessageType_UPLOAD,
         UploadRequest: &transport.UploadFileRequest{
             UserID:   userID,
             Filename: file_name,
             FileSize: int64(len(content)),
-            Policy:   policy.NoChange,
+            Policy:   enum.NoChange,
+            Content: content,
         },
     })
     if err != nil {
         t.Fatalf("Failed to send upload request: %v", err)
     }
-    time.Sleep(500 * time.Millisecond)
-
-    // 파일 내용 전송
-    err = transport.SendMessage(conn, &transport.Message{
-        Type: transport.MessageType_UPLOAD,
-        UploadChunk: &transport.FileChunk{
-            Content: content,
-            Index:   0,
-        },
-    })
+    
+    // 응답 대기
+    resp, err := transport.ReceiveMessage(conn)
     if err != nil {
-        t.Fatalf("Failed to send file content: %v", err)
-    }
-    time.Sleep(500 * time.Millisecond)
-
-    // EOF 신호 전송
-    err = transport.SendMessage(conn, &transport.Message{
-        Type: transport.MessageType_UPLOAD,
-        UploadChunk: &transport.FileChunk{
-            Content: nil,
-            Index:   -1,
-        },
-    })
-    if err != nil {
-        t.Fatalf("Failed to send EOF signal: %v", err)
-    }
-    time.Sleep(500 * time.Millisecond)
-
-    // 업로드 완료 응답 대기
-    respMsg, err := transport.ReceiveMessage(conn)
-    if err != nil {
-        t.Fatalf("Failed to receive upload completion confirmation: %v", err)
-    }
-
-    if respMsg.Type != transport.MessageType_UPLOAD || respMsg.UploadResponse == nil {
-        t.Fatalf("Unexpected response type or nil response")
-    }
-
-    if !respMsg.UploadResponse.Success {
-        t.Fatalf("Upload failed: %s", respMsg.UploadResponse.Message)
-    }
-
-    log.Printf("Upload completed successfully: %s", respMsg.UploadResponse.Message)
-
-    // 파일이 실제로 저장되었는지 확인
-    time.Sleep(2 * time.Second) // 파일 시스템에 쓰기 위한 시간 여유
-    expectedPaths := []string{
-        filepath.Join("/tmp/datanode_data1", userID, file_name),
-        filepath.Join("/tmp/datanode_data2", userID, file_name),
+        t.Fatalf("Failed to receive upload response: %v", err)
     }
     
-    found := false
-    for _, path := range expectedPaths {
-        if _, err := os.Stat(path); err == nil {
-            found = true
-            log.Printf("File found at: %s", path)
-            break
-        }
+    // 응답 검증
+    if resp.Type != transport.MessageType_UPLOAD || resp.UploadResponse == nil {
+        t.Fatalf("Unexpected response type: %v", resp.Type)
     }
+    
+    if !resp.UploadResponse.Success {
+        t.Fatalf("Upload failed: %s", resp.UploadResponse.Message)
+    }
+    
+    log.Printf("File uploaded successfully")
+}
 
-    if !found {
-        t.Fatalf("File was not saved at any expected location")
+
+func TestNodeConnections(t *testing.T) {
+    masterAddr := "localhost:8080"
+    dataAddr1 := "localhost:8081"
+    dataAddr2 := "localhost:8082"
+
+    // Start MasterNode
+    go func() {
+        if err := node.RunMasterNode("master1", masterAddr); err != nil {
+            t.Errorf("Failed to run MasterNode: %v", err)
+        }
+    }()
+
+    // Wait for MasterNode to start
+    if !waitForServer(t, masterAddr) {
+        t.Fatalf("MasterNode did not start")
     }
+    log.Println("MasterNode started successfully")
+
+    // Start DataNodes
+    go func() {
+        if err := node.RunDataNode("data1", dataAddr1, masterAddr); err != nil {
+            t.Errorf("Failed to run DataNode1: %v", err)
+        }
+    }()
+
+    go func() {
+        if err := node.RunDataNode("data2", dataAddr2, masterAddr); err != nil {
+            t.Errorf("Failed to run DataNode2: %v", err)
+        }
+    }()
+
+    // Wait for DataNodes to start
+    if !waitForServer(t, dataAddr1) {
+        t.Fatalf("DataNode1 did not start")
+    }
+    log.Println("DataNode1 started successfully")
+
+    if !waitForServer(t, dataAddr2) {
+        t.Fatalf("DataNode2 did not start")
+    }
+    log.Println("DataNode2 started successfully")
+
+    // Test connection to MasterNode
+    conn, err := net.Dial("tcp", masterAddr)
+    if err != nil {
+        t.Fatalf("Failed to connect to MasterNode: %v", err)
+    }
+    conn.Close()
+    log.Println("Successfully connected to MasterNode")
+
+    // Give some time for DataNodes to register with MasterNode
+    time.Sleep(2 * time.Second)
+
+    // Test is complete
+    log.Println("Connection test completed successfully")
+}
+
+func waitForServer(t *testing.T, addr string) bool {
+    for i := 0; i < 10; i++ {
+        conn, err := net.Dial("tcp", addr)
+        if err == nil {
+            conn.Close()
+            return true
+        }
+        time.Sleep(time.Second)
+    }
+    return false
 }

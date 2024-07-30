@@ -1,9 +1,11 @@
 package transport
 
 import (
-	policy "ChestyO/internal/enum"
+	"ChestyO/internal/enum"
 	"encoding/gob"
+	"log"
 	"net"
+	"strings"
 )
 
 type MessageType int
@@ -14,6 +16,8 @@ const (
     MessageType_DOWNLOAD
     MessageType_DELETE
     MessageType_LIST
+    MessageType_UPLOAD_CHUNK
+    MessageType_UPLOAD_CHUNK_RESPONSE
 )
 
 type Message struct {
@@ -23,35 +27,51 @@ type Message struct {
     DownloadRequest  *DownloadFileRequest
     DeleteRequest    *DeleteFileRequest
     ListRequest      *ListFilesRequest
-    UploadChunk      *FileChunk
-    DownloadChunk    *FileChunk
+    UploadChunk      *UploadFileChunk
     UploadResponse   *UploadFileResponse
     DownloadResponse *DownloadFileResponse
     DeleteResponse   *DeleteFileResponse  // 추가됨
     ListResponse     *ListFilesResponse   // 추가됨
-	ChunkRequest	 *FileChunk
+    UploadChunkResponse *UploadChunkResponse
+
 }
 
 
 func SendMessage(conn net.Conn, msg *Message) error {
     encoder := gob.NewEncoder(conn)
-    return encoder.Encode(msg)
+    err := encoder.Encode(msg)
+    if err != nil {
+        log.Printf("Error encoding message: %v", err)
+        if netErr, ok := err.(net.Error); ok {
+            log.Printf("Network error: timeout=%v, temporary=%v", netErr.Timeout(), netErr.Temporary())
+        }
+    }
+    return err
 }
 
 func ReceiveMessage(conn net.Conn) (*Message, error) {
     decoder := gob.NewDecoder(conn)
     msg := &Message{}
     err := decoder.Decode(msg)
-    return msg, err
+    if err != nil {
+        if strings.Contains(err.Error(), "duplicate type received") {
+            // 중복 타입 에러 무시 또는 로깅
+            log.Printf("Warning: Duplicate type received, ignoring: %v", err)
+            return nil, nil
+        }
+        return nil, err
+    }
+    return msg, nil
 }
 
 // Request and Response types
 type UploadFileRequest struct {
 	UserID    string
-	ChunkName string
+	// ChunkName string
 	Filename  string
 	FileSize  int64
-	Policy    policy.UploadPolicy
+	Policy    enum.UploadPolicy
+    Content   []byte
 }
 
 type UploadFileResponse struct {
@@ -90,6 +110,12 @@ type ListFilesResponse struct {
     Message string
 }
 
+
+type UploadFileChunk struct {
+	UserID    string
+	Filename  string
+    Chunk     FileChunk
+}
 type FileChunk struct {
 	Content []byte
 	Index   int
@@ -115,6 +141,7 @@ type FileMetadata struct {
 
 type RegisterMessage struct{
 	NodeID string
+    Addr   string
 }
 
 type HasFileRequest struct {
@@ -126,22 +153,27 @@ type HasFileResponse struct {
     Exists bool
 }
 
+type UploadChunkResponse struct {
+    Success    bool
+    Message    string
+    ChunkIndex int
+}
+
 func init() {
     gob.Register(Message{})
     gob.Register(RegisterMessage{})
     gob.Register(UploadFileRequest{})
+
     gob.Register(DownloadFileRequest{})
     gob.Register(DeleteFileRequest{})
     gob.Register(ListFilesRequest{})
-    gob.Register(FileChunk{})
+    gob.Register(UploadFileChunk{})
     gob.Register(UploadFileResponse{})
     gob.Register(DownloadFileResponse{})
-    gob.Register(DeleteFileResponse{})
-    gob.Register(ListFilesResponse{})
-    gob.Register(FileInfo{})
-    gob.Register(policy.UploadPolicy(0))
-    gob.Register(FileDownloadStream{})
-    gob.Register(FileMetadata{})
-    gob.Register(HasFileRequest{})
-    gob.Register(HasFileResponse{})
+    gob.Register(DeleteFileResponse{})  // 추가됨
+    gob.Register(ListFilesResponse{})   // 추가됨
+    gob.Register(UploadChunkResponse{})
+    gob.Register(FileChunk{})
+
+
 }

@@ -43,6 +43,9 @@ func (t *TCPTransport) Close() error {
 func (t *TCPTransport) handleConnection(conn net.Conn) {
     defer conn.Close()
     decoder := gob.NewDecoder(conn)
+    encoder := gob.NewEncoder(conn)
+    var currentUploadRequest *UploadFileRequest
+    var uploadStream UploadStream
 
     for {
         var msg Message
@@ -50,21 +53,46 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
         err := decoder.Decode(&msg)
         if err != nil {
             if err != io.EOF {
-                log.Printf("Error receiving message: %v", err)
+                log.Printf("TCP : Error receiving message: %v %v", err, msg)
             }
             return
         }
         log.Printf("Successfully decoded message of type: %v", msg.Type)
 
-        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
         defer cancel()
 
         var respMsg *Message
         switch msg.Type {
         case MessageType_REGISTER:
-            err = t.handler.Register(ctx, conn, msg.RegisterMessage)
+            err = t.handler.Register(ctx,msg.RegisterMessage)
         case MessageType_UPLOAD:
-            err = t.handleUpload(ctx, conn, msg.UploadRequest)
+            if msg.UploadRequest != nil {
+                currentUploadRequest = msg.UploadRequest
+                uploadStream = &tcpUploadStream{
+                    conn:    conn,
+                    decoder: decoder,
+                    encoder: encoder,
+                }
+                err = t.handler.UploadFile(ctx, currentUploadRequest, func() UploadStream {
+                    return uploadStream
+                })
+            } else if msg.UploadChunk != nil && currentUploadRequest != nil {
+                // Handle chunk upload
+                err = uploadStream.Send(msg.UploadChunk)
+                if err == nil {
+                    respMsg = &Message{
+                        Type: MessageType_UPLOAD_CHUNK_RESPONSE,
+                        UploadChunkResponse: &UploadChunkResponse{
+                            Success: true,
+                            Message: fmt.Sprintf("Chunk %d received successfully", msg.UploadChunk.Chunk.Index),
+                            ChunkIndex: msg.UploadChunk.Chunk.Index,
+                        },
+                    }
+                }
+            } else {
+                err = fmt.Errorf("invalid upload message or no active upload")
+            }
         case MessageType_DOWNLOAD:
             err = t.handleDownload(ctx, conn, msg.DownloadRequest)
         case MessageType_DELETE:
@@ -85,6 +113,24 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
                     ListResponse: resp,
                 }
             }
+        case MessageType_UPLOAD_CHUNK:
+            err = t.handler.UploadFileChunk(ctx, msg.UploadChunk)
+            if err == nil {
+                respMsg = &Message{
+                    Type: MessageType_UPLOAD_CHUNK_RESPONSE,
+                    UploadChunkResponse: &UploadChunkResponse{
+                        Success: true,
+                        Message: fmt.Sprintf("Chunk %d received successfully", msg.UploadChunk.Chunk.Index),
+                        ChunkIndex: msg.UploadChunk.Chunk.Index,
+                    },
+                }
+            }
+        case MessageType_UPLOAD_CHUNK_RESPONSE:
+            if msg.UploadChunkResponse !=nil{
+                log.Printf("Received chunk upload response for index %d: %s", 
+                msg.UploadChunkResponse.ChunkIndex, 
+                msg.UploadChunkResponse.Message)
+            }
         default:
             err = fmt.Errorf("unknown message type: %v", msg.Type)
         }
@@ -101,11 +147,18 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
         }
 
         if respMsg != nil {
+            log.Printf("TCP : SendMessage %v",respMsg)
             err = SendMessage(conn, respMsg)
             if err != nil {
                 log.Printf("Error sending response: %v", err)
                 return
             }
+        }
+
+        // Reset upload state if the upload is completed or an error occurred
+        if msg.Type != MessageType_UPLOAD || err != nil {
+            currentUploadRequest = nil
+            uploadStream = nil
         }
     }
 }
@@ -136,14 +189,16 @@ type tcpUploadStream struct {
     encoder *gob.Encoder
 }
 
-func (s *tcpUploadStream) Send(chunk *FileChunk) error {
+func (s *tcpUploadStream) Send(chunk *UploadFileChunk) error {
     return s.encoder.Encode(chunk)
 }
 
-func (s *tcpUploadStream) Recv() (*FileChunk, error) {
+func (s *tcpUploadStream) Recv() (*UploadFileChunk, error) {
+    log.Printf("Attempting to receive chunk")
     s.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
     var msg Message
     err := s.decoder.Decode(&msg)
+    log.Printf("Decoded message: %+v, Error: %v", msg, err)
     s.conn.SetReadDeadline(time.Time{}) // 타임아웃 해제
     if err != nil {
         return nil, err
