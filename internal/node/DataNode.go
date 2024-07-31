@@ -4,7 +4,6 @@ package node
 import (
 	"ChestyO/internal/store"
 	"ChestyO/internal/transport"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -38,7 +37,8 @@ func (d *DataNode) Start(ctx context.Context,addr string, masterAddr string) err
         return fmt.Errorf("failed to register with master: %v", err)
     }
 
-    transport, err := transport.NewTCPTransport(addr, d)
+    // transport, err := transport.NewTCPTransport(addr, d)
+	transport, err := transport.NewDataTCPTransport(addr,d)
     if err != nil {
         return fmt.Errorf("failed to set up TCP transport: %v", err)
     }
@@ -78,7 +78,7 @@ func RunDataNode(ctx context.Context,id, addr, masterAddr string) error {
 }
 
 // DownloadFile downloads a file from the distributed system
-func (d *DataNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
+func (d *DataNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) error {
 	return nil
 }
 
@@ -229,11 +229,14 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
     d.masterConn = conn
 
     msg := &transport.Message{
-        Type: transport.MessageType_REGISTER,
-        RegisterMessage: &transport.RegisterMessage{
-            NodeID: d.ID,
-            Addr:   addr,
-        },
+		Category: transport.MessageCategory_REQUEST,
+		Operation:  transport.MessageOperation_REGISTER,
+		Payload :  &transport.RequestPayload{
+			Register: &transport.RegisterMessage{
+				NodeID: d.ID,
+				Addr: addr,
+			},
+		},
     }
     return transport.SendMessage(conn, msg)
 }
@@ -243,21 +246,32 @@ func (m *DataNode) Register(ctx context.Context,req *transport.RegisterMessage) 
 }
 
 
-func (d *DataNode) UploadFileChunk(ctx context.Context, req *transport.UploadFileChunk) error{
+func (d *DataNode) UploadFileChunk(ctx context.Context,  stream transport.UploadStream) error{
 	log.Printf("%v : data receive",d.ID)
 
-	chunk_file_name := fmt.Sprintf("%s_chunk_%d", req.Filename, req.Chunk.Index)
-	d.store.Write(req.UserID,req.Filename,chunk_file_name,bytes.NewReader(req.Chunk.Content))
+	// chunk_file_name := fmt.Sprintf("%s_chunk_%d", req.Filename, req.Chunk.Index)
+	// _,err := d.store.Write(req.UserID,req.Filename,chunk_file_name,bytes.NewReader(req.Chunk.Content))
 	
 
-    // respMsg := &transport.Message{
-    //     Type: transport.MessageType_UPLOAD_CHUNK_RESPONSE,
-    //     UploadChunkResponse: &transport.UploadChunkResponse{
-    //         Success: true,
-    //         Message: fmt.Sprintf("Chunk %d received successfully", req.Chunk.Index),
-    //         ChunkIndex: req.Chunk.Index,
-    //     },
-    // }
-    return nil
+	// var response *transport.UploadChunkResponse;
 
+	// log.Printf("%v : Store state %+v",d.ID, err)
+	// if err ==nil{
+	// 	response = &transport.UploadChunkResponse{
+	// 		Success: true,
+	// 		Message: fmt.Sprintf("Chunk %d uploaded successfully", req.Chunk.Index),
+	// 		ChunkIndex: req.Chunk.Index,
+	// 	}
+	// }else{
+	// 	response = &transport.UploadChunkResponse{
+	// 		Success: false,
+	// 		Message: fmt.Sprintf("Chunk %d uploaded successfully", req.Chunk.Index),
+	// 		ChunkIndex: req.Chunk.Index,
+	// 	}
+	// }
+	// log.Printf("%v : data send response %v",d.ID, response)
+
+    return nil
 }
+
+

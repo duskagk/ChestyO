@@ -7,7 +7,7 @@ import (
 	"ChestyO/internal/node"
 	"ChestyO/internal/transport"
 	"context"
-	"fmt"
+	"log"
 	"net"
 	"os"
 	"testing"
@@ -19,7 +19,7 @@ var user_name = "TestUser"
 
 
 func TestFileUpload(t *testing.T) {
-    ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+    ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
     masterAddr := "localhost:8080"
@@ -46,14 +46,9 @@ func TestFileUpload(t *testing.T) {
             t.Errorf("Failed to run DataNode2: %v", err)
         }
     }()
+    time.Sleep(time.Second)
+    
 
-    // DataNode가 모두 연결될 때까지 대기
-    for i := 0; i < 30; i++ { // 최대 30초 대기
-        if master.GetConnectedDataNodesCount() == 2 {
-            break
-        }
-        time.Sleep(1 * time.Second)
-    }
     if master.GetConnectedDataNodesCount() != 2 {
         t.Fatalf("Not all DataNodes connected. Expected 2, got %d", master.GetConnectedDataNodesCount())
     }
@@ -64,7 +59,7 @@ func TestFileUpload(t *testing.T) {
     }
 
     // MasterNode에 연결
-    conn, err := net.DialTimeout("tcp", masterAddr, 30*time.Second)
+    conn, err := net.Dial("tcp", masterAddr)
     if err != nil {
         t.Fatalf("Failed to connect to MasterNode: %v", err)
     }
@@ -73,8 +68,9 @@ func TestFileUpload(t *testing.T) {
 
     // 업로드 요청 전송
     err = transport.SendMessage(conn, &transport.Message{
-        Type: transport.MessageType_UPLOAD,
-        UploadRequest: &transport.UploadFileRequest{
+        Category :  transport.MessageCategory_REQUEST,
+        Operation : transport.MessageOperation_UPLOAD,
+        Payload  :  &transport.UploadFileRequest{
             UserID:   user_name,
             Filename: file_name,
             FileSize: int64(len(content)),
@@ -85,28 +81,23 @@ func TestFileUpload(t *testing.T) {
     if err != nil {
         t.Fatalf("Failed to send upload request: %v", err)
     }
-    
-    respChan := make(chan *transport.Message)
-    errChan := make(chan error)
 
-    go func() {
-        resp, err := transport.ReceiveMessage(conn)
-        if err != nil {
-            errChan <- err
-        } else {
-            respChan <- resp
-        }
-    }()
-    
-    select {
-    case resp := <-respChan:
-        fmt.Printf("Receive : %v",resp)
-        // 응답 처리
-    case err := <-errChan:
+    // 응답 대기
+    response, err := transport.ReceiveMessage(conn)
+    if err != nil {
         t.Fatalf("Failed to receive upload response: %v", err)
-    case <-ctx.Done():
-        t.Fatalf("Timeout or context cancelled while waiting for upload response")
     }
-    cancel()
+
+    // 응답 확인
+    if err!=nil {
+        t.Fatalf("Unexpected response type: %v", response)
+    }
+
+    // if !response.UploadResponse.Success {
+    //     t.Fatalf("Upload failed: %s", response.UploadResponse.Message)
+    // }
+
+    log.Printf("Upload successful: %+v", response)
+    conn.Close()
 }
 

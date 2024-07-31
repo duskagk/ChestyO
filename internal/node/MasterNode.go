@@ -10,10 +10,8 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sort"
 	"strings"
 	"sync"
-	"time"
 )
 
 type DataNodeInfo struct {
@@ -49,24 +47,24 @@ func (m *MasterNode) HasFile(ctx context.Context,userId, filename string) (bool)
 }
 
 // node/master.go
-func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
+func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest) error {
 
 	fileExists := m.HasFile(ctx,req.UserID, req.Filename)
 
 	if fileExists {
 		switch req.Policy {
 		case policy.Overwrite:
-			return m.handleOverwrite(ctx, req, createStream)
+			return m.handleOverwrite(ctx, req)
 		default:
 			return fmt.Errorf("can't")
 		}
 	} else {
 		// 새 파일 업로드
-		return m.handleNewUpload(ctx, req, createStream)
+		return m.handleNewUpload(ctx, req)
 	}
 }
 
-func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
+func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest) error {
 
     log.Printf("MasterNode: Handling new upload for file %s from user %s", req.Filename, req.UserID)
     // 3. Split the file into chunks
@@ -88,82 +86,52 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
         return fmt.Errorf("failed to upload chunks: %v", err)
     }
 
+    // finalResponse := &transport.Message{
+    //     Type: transport.MessageType_UPLOAD_RESPONSE,
+    //     UploadResponse: &transport.UploadFileResponse{
+    //         Success: true,
+    //         Message: fmt.Sprintf("File %s uploaded successfully", req.Filename),
+    //     },
+    // }
+    log.Printf("MasterNode: Close and recev %s for user %s", req.Filename, req.UserID)
+    // createStream().Send(finalResponse)
+
     log.Printf("MasterNode: Successfully uploaded file %s for user %s", req.Filename, req.UserID)
     return nil
 }
 
 
 func (m *MasterNode) sendChunkToDataNode(ctx context.Context, dataNode *DataNodeInfo, req *transport.UploadFileRequest, chunk *transport.FileChunk) error {
-    log.Printf("MasterNode: Starting to send chunk %d to DataNode %s\n", chunk.Index, dataNode.ID)
+    log.Printf("MasterNode: Starting to send chunk %d to DataNode %s", chunk.Index, dataNode.ID)
 
-    // Chunk 데이터 전송
+    if dataNode.Conn == nil {
+        return fmt.Errorf("connection to DataNode %s is nil", dataNode.ID)
+    }
+
+
+
     chunkMsg := &transport.Message{
-        Type:        transport.MessageType_UPLOAD_CHUNK,
-        UploadChunk: &transport.UploadFileChunk{
-            UserID    :req.UserID,
-            Filename  :req.Filename,
-            Chunk     : *chunk,
+        Category   :transport.MessageCategory_REQUEST,
+        Operation:  transport.MessageOperation_UPLOAD_CHUNK,
+        Payload: &transport.UploadFileChunk{
+            UserID: req.UserID,
+            Filename: req.Filename,
+            Chunk: *chunk,
         },
     }
+
     err := transport.SendMessage(dataNode.Conn, chunkMsg)
     if err != nil {
-        log.Printf("MasterNode: Error sending chunk data to DataNode %s: %v\n", dataNode.ID, err)
+        log.Printf("MasterNode: Error sending chunk data to DataNode %s: %v", dataNode.ID, err)
         return fmt.Errorf("failed to send chunk: %v", err)
     }
-    log.Printf("MasterNode: Successfully sent chunk data to DataNode %s\n", dataNode.ID)
 
-    // 응답 대기
-    respChan := make(chan *transport.Message, 1)
-    errChan := make(chan error, 1)
-
-    go func() {
-        respMsg, err := transport.ReceiveMessage(dataNode.Conn)
-        if err != nil {
-            errChan <- fmt.Errorf("failed to receive response: %v", err)
-            return
-        }
-        respChan <- respMsg
-    }()
-
-    select {
-    case <-ctx.Done():
-        return ctx.Err()
-    case respMsg := <-respChan:
-        log.Printf("MasterNode: Received response from DataNode %s: %+v\n", dataNode.ID, respMsg)
-        
-        // respMsg 처리
-        if respMsg.Type != transport.MessageType_UPLOAD_CHUNK_RESPONSE {
-            return fmt.Errorf("unexpected response type: %v", respMsg.Type)
-        }
-        
-        if respMsg.UploadChunkResponse == nil {
-            return fmt.Errorf("null UploadChunkResponse")
-        }
-        
-        if !respMsg.UploadChunkResponse.Success {
-            return fmt.Errorf("chunk upload failed: %s", respMsg.UploadChunkResponse.Message)
-        }
-        
-        if respMsg.UploadChunkResponse.ChunkIndex != chunk.Index {
-            return fmt.Errorf("mismatched chunk index: expected %d, got %d", chunk.Index, respMsg.UploadChunkResponse.ChunkIndex)
-        }
-        
-        log.Printf("MasterNode: Chunk %d successfully uploaded to DataNode %s\n", chunk.Index, dataNode.ID)
-        return nil
-
-    case err := <-errChan:
-        log.Printf("MasterNode: Error receiving response from DataNode %s: %v\n", dataNode.ID, err)
-        return err
-
-    case <-time.After(10 * time.Second):  // 타임아웃 시간을 30초로 증가
-        log.Printf("MasterNode: Timeout waiting for response from DataNode %s\n", dataNode.ID)
-        return fmt.Errorf("timeout waiting for response")
-    }
+    log.Printf("MasterNode: Successfully sent chunk data to DataNode %s", dataNode.ID)
+    return nil
 }
 
 
-
-func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
+func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadFileRequest) error {
 	deleteReq := &transport.DeleteFileRequest{
 		Filename: req.Filename,
 		UserID:   req.UserID,
@@ -173,14 +141,14 @@ func (m *MasterNode) handleOverwrite(ctx context.Context, req *transport.UploadF
 		return fmt.Errorf("failed to delete exist file : %v", err)
 	}
 
-	return m.handleNewUpload(ctx, req, createStream)
+	return m.handleNewUpload(ctx, req)
 }
 
 
-func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
+func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) error {
 
 	if isExist := m.HasFile(ctx,req.UserID, req.Filename); isExist {
-		return m.handleDownloadFile(ctx, req, stream)
+		return m.handleDownloadFile(ctx, req)
 	}
 	return fmt.Errorf("file not found: %s", req.Filename)
 }
@@ -255,7 +223,7 @@ func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequ
 }
 
 func (m *MasterNode) Start(ctx context.Context,addr string) error {
-    transport, err := transport.NewTCPTransport(addr, m)
+    transport, err := transport.NewMasterTCPTransport(addr, m)
     if err != nil {
         return fmt.Errorf("failed to set up TCP transport: %v", err)
     }
@@ -313,43 +281,43 @@ func (m *MasterNode) hasFileAsync(ctx context.Context,userId, filename string, r
 	}()
 }
 
-func (m *MasterNode) handleDownloadFile(ctx context.Context, req *transport.DownloadFileRequest, stream transport.DownloadStream) error {
+func (m *MasterNode) handleDownloadFile(ctx context.Context, req *transport.DownloadFileRequest) error {
 	
-    mu := m.getUserMutex(req.UserID)
-    mu.Lock()
-    defer mu.Unlock()
+    // mu := m.getUserMutex(req.UserID)
+    // mu.Lock()
+    // defer mu.Unlock()
 
-	log.Printf("Attempting to download file: %s for user: %s", req.Filename, req.UserID)
+	// log.Printf("Attempting to download file: %s for user: %s", req.Filename, req.UserID)
 
-	fds, ok := stream.(*transport.FileDownloadStream)
-	if !ok {
-		return fmt.Errorf("unsupported stream type")
-	}
+	// fds, ok := stream.(*transport.FileDownloadStream)
+	// if !ok {
+	// 	return fmt.Errorf("unsupported stream type")
+	// }
 
-	allChunks := make(map[int][]byte)
-	var wg sync.WaitGroup
+	// allChunks := make(map[int][]byte)
+	// var wg sync.WaitGroup
 
 
 
-	wg.Wait()
+	// wg.Wait()
 
-	if len(allChunks) == 0 {
-		return fmt.Errorf("file not found: %s", req.Filename)
-	}
+	// if len(allChunks) == 0 {
+	// 	return fmt.Errorf("file not found: %s", req.Filename)
+	// }
 
-	// 인덱스를 기준으로 정렬
-	var sortedIndexes []int
-	for index := range allChunks {
-		sortedIndexes = append(sortedIndexes, index)
-	}
-	sort.Ints(sortedIndexes)
+	// // 인덱스를 기준으로 정렬
+	// var sortedIndexes []int
+	// for index := range allChunks {
+	// 	sortedIndexes = append(sortedIndexes, index)
+	// }
+	// sort.Ints(sortedIndexes)
 
-	// 정렬된 청크들을 스트림에 추가
-	for _, index := range sortedIndexes {
-		fds.AddChunk(allChunks[index])
-	}
+	// // 정렬된 청크들을 스트림에 추가
+	// for _, index := range sortedIndexes {
+	// 	fds.AddChunk(allChunks[index])
+	// }
 
-	log.Printf("Successfully downloaded file %s with %d chunks", req.Filename, len(allChunks))
+	// log.Printf("Successfully downloaded file %s with %d chunks", req.Filename, len(allChunks))
 	return nil
 
 }
@@ -361,7 +329,7 @@ func (m *MasterNode) getUserMutex(userID string) *sync.RWMutex {
 }
 
 func (m *MasterNode) handleRegister(msg *transport.RegisterMessage) error {
-    fmt.Printf("MasterNode: Received registration request from %v\n", msg)
+    log.Printf("MasterNode: Received registration request from %v\n", msg)
 
     m.mu.Lock()
     defer m.mu.Unlock()
@@ -370,20 +338,15 @@ func (m *MasterNode) handleRegister(msg *transport.RegisterMessage) error {
     if existingNode, exists := m.dataNodes[msg.NodeID]; exists {
         log.Printf("DataNode %s already registered. Updating address from %s to %s", msg.NodeID, existingNode.Addr, msg.Addr)
         existingNode.Addr = msg.Addr
-        // 기존 연결이 있다면 닫기
         if existingNode.Conn != nil {
             existingNode.Conn.Close()
             existingNode.Conn = nil
         }
     } 
-
     conn, err := net.Dial("tcp", msg.Addr)
-
     if err !=nil{
         log.Printf("MasterNode : Connect faile with data node")
     }
-
-        // 새 DataNode 정보 저장
     m.dataNodes[msg.NodeID] = &DataNodeInfo{
         ID:   msg.NodeID,
         Addr: msg.Addr,
@@ -431,6 +394,13 @@ func (m *MasterNode) uploadChunksToDataNodes(ctx context.Context, req *transport
 
     var wg sync.WaitGroup
     errChan := make(chan error, len(chunkDistribution))
+    
+    // 총 청크 수를 계산합니다
+    totalChunks := 0
+    for _, chunks := range chunkDistribution {
+        totalChunks += len(chunks)
+    }
+    responseChan := make(chan *transport.UploadChunkResponse, totalChunks)
 
     for dataNode, chunks := range chunkDistribution {
         wg.Add(1)
@@ -443,21 +413,34 @@ func (m *MasterNode) uploadChunksToDataNodes(ctx context.Context, req *transport
                     return
                 default:
                     err := m.sendChunkToDataNode(ctx, node, req, &chunk)
+                    log.Printf("Master : send chunk to datanode")
                     if err != nil {
                         errChan <- fmt.Errorf("failed to send chunk %d to DataNode %s: %v", chunk.Index, node.ID, err)
                         return
                     }
+                    
+                    // DataNode로부터의 응답 대기
+                    // response, err := m.waitForDataNodeResponse(node)
+                    if err != nil {
+                        errChan <- fmt.Errorf("failed to receive response for chunk %d from DataNode %s: %v", chunk.Index, node.ID, err)
+                        return
+                    }
+                    
+                    // responseChan <- response
                     log.Printf("MasterNode: Successfully sent and processed chunk %d for DataNode %s", chunk.Index, node.ID)
                 }
             }
         }(dataNode, chunks)
     }
 
+    // 모든 고루틴이 완료될 때까지 대기
     go func() {
         wg.Wait()
         close(errChan)
+        close(responseChan)
     }()
 
+    // 에러 처리
     for err := range errChan {
         if err != nil {
             log.Printf("MasterNode: Error during chunk upload: %v", err)
@@ -465,9 +448,24 @@ func (m *MasterNode) uploadChunksToDataNodes(ctx context.Context, req *transport
         }
     }
 
+    // 응답 처리
+    successfulUploads := 0
+    for response := range responseChan {
+        if response.Success {
+            successfulUploads++
+        } else {
+            log.Printf("MasterNode: Chunk upload failed: %s", response.Message)
+        }
+    }
+
+    if successfulUploads != totalChunks {
+        return fmt.Errorf("not all chunks were uploaded successfully: %d/%d", successfulUploads, totalChunks)
+    }
+
     log.Printf("MasterNode: All chunks uploaded successfully for file %s", req.Filename)
     return nil
 }
+
 
 func (m *MasterNode) UploadFileChunk(ctx context.Context, chunk *transport.UploadFileChunk) error{
     return nil

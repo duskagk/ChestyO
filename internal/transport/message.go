@@ -8,32 +8,48 @@ import (
 	"strings"
 )
 
-type MessageType int
+type MessageCategory int
 
 const (
-    MessageType_REGISTER MessageType = iota
-    MessageType_UPLOAD
-    MessageType_DOWNLOAD
-    MessageType_DELETE
-    MessageType_LIST
-    MessageType_UPLOAD_CHUNK
-    MessageType_UPLOAD_CHUNK_RESPONSE
+    MessageCategory_REQUEST MessageCategory = iota
+    MessageCategory_RESPONSE
+)
+
+type MessageOperation int
+
+const (
+    MessageOperation_REGISTER MessageOperation = iota
+    MessageOperation_UPLOAD
+    MessageOperation_DOWNLOAD
+    MessageOperation_DELETE
+    MessageOperation_LIST
+    MessageOperation_UPLOAD_CHUNK
 )
 
 type Message struct {
-    Type             MessageType
-    RegisterMessage  *RegisterMessage
-    UploadRequest    *UploadFileRequest
-    DownloadRequest  *DownloadFileRequest
-    DeleteRequest    *DeleteFileRequest
-    ListRequest      *ListFilesRequest
-    UploadChunk      *UploadFileChunk
-    UploadResponse   *UploadFileResponse
-    DownloadResponse *DownloadFileResponse
-    DeleteResponse   *DeleteFileResponse  // 추가됨
-    ListResponse     *ListFilesResponse   // 추가됨
-    UploadChunkResponse *UploadChunkResponse
+    Category   MessageCategory
+    Operation  MessageOperation
+    Payload    interface{}
+}
 
+type RequestPayload struct {
+    Register       *RegisterMessage
+    Upload         *UploadFileRequest
+    Download       *DownloadFileRequest
+    Delete         *DeleteFileRequest
+    List           *ListFilesRequest
+    UploadChunk    *UploadFileChunk
+}
+
+type ResponsePayload struct {
+    Register       *RegisterResponse
+    Upload         *UploadFileResponse
+    Download       *DownloadFileResponse
+    Delete         *DeleteFileResponse
+    List           *ListFilesResponse
+    UploadChunk    *UploadChunkResponse
+    Success        *SuccessResponse
+    Error          *ErrorResponse
 }
 
 
@@ -68,11 +84,15 @@ func ReceiveMessage(conn net.Conn) (*Message, error) {
 // Request and Response types
 type UploadFileRequest struct {
 	UserID    string
-	// ChunkName string
 	Filename  string
 	FileSize  int64
 	Policy    enum.UploadPolicy
     Content   []byte
+}
+
+type RegisterResponse struct {
+    Success bool
+	Message string
 }
 
 type UploadFileResponse struct {
@@ -160,21 +180,55 @@ type UploadChunkResponse struct {
     ChunkIndex int
 }
 
+type ErrorResponse struct {
+    Message     string
+}
+
+type SuccessResponse struct{
+    Message     string
+}
+
+func createErrorResponse(operation MessageOperation, errMsg string) *Message {
+    return &Message{
+        Category:  MessageCategory_RESPONSE,
+        Operation: operation,
+        Payload: &ResponsePayload{
+            Error: &ErrorResponse{
+                Message: errMsg,
+            },
+        },
+    }
+}
+
+func createSuccessResponse(operation MessageOperation, msg string) *Message {
+    return &Message{
+        Category:  MessageCategory_RESPONSE,
+        Operation: operation,
+        Payload: &ResponsePayload{
+            Success: &SuccessResponse{
+                Message: msg,
+            },
+        },
+    }
+}
+
+
 func init() {
-    gob.Register(Message{})
-    gob.Register(RegisterMessage{})
-    gob.Register(UploadFileRequest{})
-
-    gob.Register(DownloadFileRequest{})
-    gob.Register(DeleteFileRequest{})
-    gob.Register(ListFilesRequest{})
-    gob.Register(UploadFileChunk{})
-    gob.Register(UploadFileResponse{})
-    gob.Register(DownloadFileResponse{})
-    gob.Register(DeleteFileResponse{})  // 추가됨
-    gob.Register(ListFilesResponse{})   // 추가됨
-    gob.Register(UploadChunkResponse{})
-    gob.Register(FileChunk{})
-
-
+    gob.Register(&Message{})
+    gob.Register(&RequestPayload{})
+    gob.Register(&ResponsePayload{})
+    // gob.Register(&RegisterMessage{})
+    // gob.Register(&UploadFileRequest{})
+    // gob.Register(&DownloadFileRequest{})
+    // gob.Register(&DeleteFileRequest{})
+    // gob.Register(&ListFilesRequest{})
+    // gob.Register(&UploadFileChunk{})
+    // gob.Register(&RegisterResponse{})
+    // gob.Register(&UploadFileResponse{})
+    // gob.Register(&DownloadFileResponse{})
+    // gob.Register(&DeleteFileResponse{})
+    // gob.Register(&ListFilesResponse{})
+    // gob.Register(&UploadChunkResponse{})
+    // gob.Register(&SuccessResponse{})
+    // gob.Register(&ErrorResponse{})
 }
