@@ -7,6 +7,7 @@ import (
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"net"
@@ -65,36 +66,48 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 }
 
 func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest) error {
-
     log.Printf("MasterNode: Handling new upload for file %s from user %s", req.Filename, req.UserID)
-    // 3. Split the file into chunks
+
     chunks := utils.SplitFileIntoChunks(req.Content)
-
-    // 4. Select DataNodes for upload
-    selectedNodes := m.selectDataNodesForUpload(len(chunks))
-    if len(selectedNodes) == 0 {
-        return fmt.Errorf("no available DataNodes for upload")
+    availableNodes := m.getAvailableDataNodes()
+    if len(availableNodes) == 0 {
+        return fmt.Errorf("no available data nodes for upload")
     }
 
-    
-    // 5. Distribute chunks to DataNodes
-    chunkDistribution := m.distributeChunks(chunks, selectedNodes)
-
-    // 6. Upload chunks to DataNodes
-    err := m.uploadChunksToDataNodes(ctx, req, chunkDistribution)
-    if err != nil {
-        return fmt.Errorf("failed to upload chunks: %v", err)
+    chunkDistribution := make(map[string][]transport.FileChunk)
+    for i, chunk := range chunks {
+        nodeIndex := i % len(availableNodes)
+        nodeID := availableNodes[nodeIndex].ID
+        chunkDistribution[nodeID] = append(chunkDistribution[nodeID], chunk)
     }
 
-    // finalResponse := &transport.Message{
-    //     Type: transport.MessageType_UPLOAD_RESPONSE,
-    //     UploadResponse: &transport.UploadFileResponse{
-    //         Success: true,
-    //         Message: fmt.Sprintf("File %s uploaded successfully", req.Filename),
-    //     },
-    // }
-    log.Printf("MasterNode: Close and recev %s for user %s", req.Filename, req.UserID)
-    // createStream().Send(finalResponse)
+    var failedChunks []transport.FileChunk
+    for nodeID, nodeChunks := range chunkDistribution {
+        err := m.sendChunksToDataNode(ctx, nodeID, req.UserID, req.Filename, nodeChunks)
+        if err != nil {
+            log.Printf("Failed to send chunks to DataNode %s: %v. Will retry with other nodes.", nodeID, err)
+            failedChunks = append(failedChunks, nodeChunks...)
+            delete(chunkDistribution, nodeID)
+            // 실패한 노드를 사용 가능한 노드 목록에서 제거
+            availableNodes = removeNode(availableNodes, nodeID)
+        }
+    }
+
+    // 실패한 청크들을 남은 노드들에게 재분배
+    if len(failedChunks) > 0 {
+        if len(availableNodes) == 0 {
+            return fmt.Errorf("no available nodes left to handle failed chunks")
+        }
+        for i, chunk := range failedChunks {
+            nodeIndex := i % len(availableNodes)
+            nodeID := availableNodes[nodeIndex].ID
+            err := m.sendChunksToDataNode(ctx, nodeID, req.UserID, req.Filename, []transport.FileChunk{chunk})
+            if err != nil {
+                return fmt.Errorf("failed to redistribute chunk %d: %v", chunk.Index, err)
+            }
+            chunkDistribution[nodeID] = append(chunkDistribution[nodeID], chunk)
+        }
+    }
 
     log.Printf("MasterNode: Successfully uploaded file %s for user %s", req.Filename, req.UserID)
     return nil
@@ -475,4 +488,124 @@ func (m *MasterNode) GetConnectedDataNodesCount() int {
     m.mu.RLock()
     defer m.mu.RUnlock()
     return len(m.dataNodes)
+}
+
+
+// 사용 가능한 DataNode 목록을 반환하는 헬퍼 함수
+func (m *MasterNode) getAvailableDataNodes() []*DataNodeInfo {
+    m.mu.RLock()
+    defer m.mu.RUnlock()
+    
+    nodes := make([]*DataNodeInfo, 0, len(m.dataNodes))
+    for _, node := range m.dataNodes {
+        nodes = append(nodes, node)
+    }
+    return nodes
+}
+
+func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, filename string, chunks []transport.FileChunk) error {
+    node, ok := m.dataNodes[nodeID]
+    if !ok {
+        return fmt.Errorf("DataNode %s not found", nodeID)
+    }
+
+    conn, err := net.Dial("tcp", node.Addr)
+    if err != nil {
+        return fmt.Errorf("failed to connect to DataNode %s: %v", nodeID, err)
+    }
+    defer conn.Close()
+
+    encoder := gob.NewEncoder(conn)
+    decoder := gob.NewDecoder(conn)
+
+    // 청크 전송을 위한 고루틴 생성
+    chunkChan := make(chan transport.FileChunk)
+    errChan := make(chan error)
+    doneChan := make(chan bool)
+
+    go func() {
+        for chunk := range chunkChan {
+            retries := 3
+            for retries > 0 {
+                req := &transport.Message{
+                    Category: transport.MessageCategory_REQUEST,
+                    Operation: transport.MessageOperation_UPLOAD_CHUNK,
+                    Payload: &transport.RequestPayload{
+                        UploadChunk: &transport.UploadFileChunk{
+                            UserID:   userID,
+                            Filename: filename,
+                            Chunk:    chunk,
+                        },
+                    },
+                }
+
+                err := encoder.Encode(req)
+                if err != nil {
+                    log.Printf("Failed to send chunk %d: %v. Retries left: %d", chunk.Index, err, retries-1)
+                    retries--
+                    continue
+                }
+
+                var resp transport.Message
+                err = decoder.Decode(&resp)
+                if err != nil {
+                    log.Printf("Failed to receive response for chunk %d: %v. Retries left: %d", chunk.Index, err, retries-1)
+                    retries--
+                    continue
+                }
+
+                if resp.Category == transport.MessageCategory_RESPONSE && resp.Operation == transport.MessageOperation_UPLOAD_CHUNK {
+                    payload, ok := resp.Payload.(*transport.ResponsePayload)
+                    if !ok || payload.UploadChunk == nil || !payload.UploadChunk.Success {
+                        log.Printf("Upload failed for chunk %d. Retries left: %d", chunk.Index, retries-1)
+                        retries--
+                        continue
+                    }
+                    // 성공적으로 청크 전송
+                    break
+                }
+            }
+
+            if retries == 0 {
+                errChan <- fmt.Errorf("failed to upload chunk %d after 3 retries", chunk.Index)
+                return
+            }
+        }
+        doneChan <- true
+    }()
+
+    // 청크 전송
+    for _, chunk := range chunks {
+        select {
+        case chunkChan <- chunk:
+        case err := <-errChan:
+            close(chunkChan)
+            return err
+        case <-ctx.Done():
+            close(chunkChan)
+            return ctx.Err()
+        }
+    }
+
+    close(chunkChan)
+
+    // 모든 청크 전송 완료 대기
+    select {
+    case <-doneChan:
+        return nil
+    case err := <-errChan:
+        return err
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+
+
+func removeNode(nodes []*DataNodeInfo, nodeID string) []*DataNodeInfo {
+    for i, node := range nodes {
+        if node.ID == nodeID {
+            return append(nodes[:i], nodes[i+1:]...)
+        }
+    }
+    return nodes
 }

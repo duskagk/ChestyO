@@ -6,7 +6,7 @@ import "ChestyO/internal/transport"
 
 
 
-const ChunkSize = 1024 // 1MB
+const ChunkSize = 50 // 1MB
 
 func SplitFileIntoChunks(content []byte) []transport.FileChunk {
 	var chunks []transport.FileChunk

@@ -66,16 +66,19 @@ func TestFileUpload(t *testing.T) {
     defer conn.Close()
 
 
+    log.Printf("Send Upload request ...")
     // 업로드 요청 전송
     err = transport.SendMessage(conn, &transport.Message{
         Category :  transport.MessageCategory_REQUEST,
         Operation : transport.MessageOperation_UPLOAD,
-        Payload  :  &transport.UploadFileRequest{
-            UserID:   user_name,
-            Filename: file_name,
-            FileSize: int64(len(content)),
-            Policy:   enum.NoChange,
-            Content:  content,
+            Payload  :  &transport.RequestPayload{
+                Upload: &transport.UploadFileRequest{
+                UserID:   user_name,
+                Filename: file_name,
+                FileSize: int64(len(content)),
+                Policy:   enum.NoChange,
+                Content:  content,
+            },
         },
     })
     if err != nil {

@@ -25,7 +25,9 @@ type DataFileService interface {
 
 
 type UploadStream interface {
-    Send(*UploadFileChunk) error
+	Recv() (*UploadFileChunk, error)
+    Send(*UploadChunkResponse) error
+	SendAndClose(*UploadChunkResponse) error
     CloseAndRecv() (*UploadFileResponse, error)
 }
 

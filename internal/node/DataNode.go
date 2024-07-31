@@ -4,6 +4,7 @@ package node
 import (
 	"ChestyO/internal/store"
 	"ChestyO/internal/transport"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -248,6 +249,49 @@ func (m *DataNode) Register(ctx context.Context,req *transport.RegisterMessage) 
 
 func (d *DataNode) UploadFileChunk(ctx context.Context,  stream transport.UploadStream) error{
 	log.Printf("%v : data receive",d.ID)
+
+    for {
+        chunk, err := stream.Recv()
+        if err == io.EOF {
+            // 모든 청크를 받았음
+            log.Printf("%v: Finished receiving all chunks", d.ID)
+            return stream.SendAndClose(&transport.UploadChunkResponse{
+                Success: true,
+                Message: "All chunks received successfully",
+            })
+        }
+        if err != nil {
+            log.Printf("%v: Error receiving chunk: %v", d.ID, err)
+            return err
+        }
+
+        // 청크 파일 이름 생성
+        chunkFileName := fmt.Sprintf("%s_chunk_%d", chunk.Filename, chunk.Chunk.Index)
+
+        // 청크 저장
+        _, err = d.store.Write(chunk.UserID, chunk.Filename, chunkFileName, bytes.NewReader(chunk.Chunk.Content))
+        if err != nil {
+            log.Printf("%v: Error storing chunk %d: %v", d.ID, chunk.Chunk.Index, err)
+            return stream.SendAndClose(&transport.UploadChunkResponse{
+                Success: false,
+                Message: fmt.Sprintf("Failed to store chunk %d: %v", chunk.Chunk.Index, err),
+                ChunkIndex: chunk.Chunk.Index,
+            })
+        }
+
+        log.Printf("%v: Successfully stored chunk %d of file %s for user %s", d.ID, chunk.Chunk.Index, chunk.Filename, chunk.UserID)
+
+        // 각 청크 저장 성공 후 응답 전송 (선택적)
+        err = stream.Send(&transport.UploadChunkResponse{
+            Success: true,
+            Message: fmt.Sprintf("Chunk %d uploaded successfully", chunk.Chunk.Index),
+            ChunkIndex: chunk.Chunk.Index,
+        })
+        if err != nil {
+            log.Printf("%v: Error sending response for chunk %d: %v", d.ID, chunk.Chunk.Index, err)
+            return err
+        }
+    }
 
 	// chunk_file_name := fmt.Sprintf("%s_chunk_%d", req.Filename, req.Chunk.Index)
 	// _,err := d.store.Write(req.UserID,req.Filename,chunk_file_name,bytes.NewReader(req.Chunk.Content))

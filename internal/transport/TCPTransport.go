@@ -99,14 +99,17 @@ func (t *TCPTransport) handleConnection(ctx context.Context, conn net.Conn) {
             if msg.Category == MessageCategory_REQUEST{
                 switch msg.Operation{
                 case MessageOperation_REGISTER:
-                    log.Printf("Register Case")
+                    
                     resp := t.handleRequestRegister(operationCtx, msg);
                     log.Printf("%v",resp)
                 case MessageOperation_UPLOAD:
+                    
                     if t.isMaster{
                         resp := t.handleRequestUploadFile(operationCtx, &msg)
                         log.Printf("%v",resp)
                     }
+                case MessageOperation_UPLOAD_CHUNK:
+                    log.Printf("Upload chunk Case")
                 }
             }else if msg.Category == MessageCategory_RESPONSE{
                 switch msg.Operation{
