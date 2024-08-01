@@ -11,7 +11,7 @@ type FileService interface {
 
 type MasterFileService interface{
 	FileService
-    UploadFile(ctx context.Context, req *UploadFileRequest) error
+    UploadFile(ctx context.Context, req *UploadFileRequest,stream UploadStream) error
 	// DownloadFile(ctx context.Context, req *DownloadFileRequest, stream DownloadStream) error
     DeleteFile(ctx context.Context, req *DeleteFileRequest) (*DeleteFileResponse, error)
     ListFiles(ctx context.Context, req *ListFilesRequest) (*ListFilesResponse, error)
@@ -25,9 +25,9 @@ type DataFileService interface {
 
 
 type UploadStream interface {
-	Recv() (*UploadFileChunk, error)
-    Send(*UploadChunkResponse) error
-	SendAndClose(*UploadChunkResponse) error
+	Recv() (*UploadFileChunkRequest, error)
+    Send(*UploadFileChunkRequest) error
+	SendAndClose(*UploadFileResponse) error
     CloseAndRecv() (*UploadFileResponse, error)
 }
 

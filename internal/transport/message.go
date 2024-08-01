@@ -38,7 +38,7 @@ type RequestPayload struct {
     Download       *DownloadFileRequest
     Delete         *DeleteFileRequest
     List           *ListFilesRequest
-    UploadChunk    *UploadFileChunk
+    UploadChunk    *UploadFileChunkRequest
 }
 
 type ResponsePayload struct {
@@ -132,7 +132,7 @@ type ListFilesResponse struct {
 }
 
 
-type UploadFileChunk struct {
+type UploadFileChunkRequest struct {
 	UserID    string
 	Filename  string
     Chunk     FileChunk
@@ -217,18 +217,8 @@ func init() {
     gob.Register(&Message{})
     gob.Register(&RequestPayload{})
     gob.Register(&ResponsePayload{})
-    // gob.Register(&RegisterMessage{})
-    // gob.Register(&UploadFileRequest{})
-    // gob.Register(&DownloadFileRequest{})
-    // gob.Register(&DeleteFileRequest{})
-    // gob.Register(&ListFilesRequest{})
-    // gob.Register(&UploadFileChunk{})
-    // gob.Register(&RegisterResponse{})
-    // gob.Register(&UploadFileResponse{})
-    // gob.Register(&DownloadFileResponse{})
-    // gob.Register(&DeleteFileResponse{})
-    // gob.Register(&ListFilesResponse{})
-    // gob.Register(&UploadChunkResponse{})
-    // gob.Register(&SuccessResponse{})
-    // gob.Register(&ErrorResponse{})
+    gob.Register(&FileChunk{})
+    gob.Register(UploadFileResponse{})
+    gob.Register(UploadFileChunkRequest{})
+    // gob.Register(UploadStream{})
 }

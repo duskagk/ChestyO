@@ -64,10 +64,9 @@ func (d * DataNode) Stop(){
 }
 
 // node/data.go
-func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-
-	return nil;
-}
+// func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
+// 	return nil;
+// }
 
 func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)
@@ -247,75 +246,30 @@ func (m *DataNode) Register(ctx context.Context,req *transport.RegisterMessage) 
 }
 
 
-func (d *DataNode) UploadFileChunk(ctx context.Context,  stream transport.UploadStream) error{
-	log.Printf("%v : data receive",d.ID)
+func (d *DataNode) UploadFileChunk(ctx context.Context, stream transport.UploadStream) error {
+    log.Printf("DataNode %s: Starting to receive file chunks", d.ID)
 
     for {
         chunk, err := stream.Recv()
+		log.Printf("DataNode %v: chunk %v", d.ID, chunk)
         if err == io.EOF {
-            // 모든 청크를 받았음
-            log.Printf("%v: Finished receiving all chunks", d.ID)
-            return stream.SendAndClose(&transport.UploadChunkResponse{
-                Success: true,
-                Message: "All chunks received successfully",
-            })
+            break
         }
         if err != nil {
-            log.Printf("%v: Error receiving chunk: %v", d.ID, err)
             return err
         }
 
-        // 청크 파일 이름 생성
+        // Store the chunk
         chunkFileName := fmt.Sprintf("%s_chunk_%d", chunk.Filename, chunk.Chunk.Index)
-
-        // 청크 저장
         _, err = d.store.Write(chunk.UserID, chunk.Filename, chunkFileName, bytes.NewReader(chunk.Chunk.Content))
         if err != nil {
-            log.Printf("%v: Error storing chunk %d: %v", d.ID, chunk.Chunk.Index, err)
-            return stream.SendAndClose(&transport.UploadChunkResponse{
-                Success: false,
-                Message: fmt.Sprintf("Failed to store chunk %d: %v", chunk.Chunk.Index, err),
-                ChunkIndex: chunk.Chunk.Index,
-            })
-        }
-
-        log.Printf("%v: Successfully stored chunk %d of file %s for user %s", d.ID, chunk.Chunk.Index, chunk.Filename, chunk.UserID)
-
-        // 각 청크 저장 성공 후 응답 전송 (선택적)
-        err = stream.Send(&transport.UploadChunkResponse{
-            Success: true,
-            Message: fmt.Sprintf("Chunk %d uploaded successfully", chunk.Chunk.Index),
-            ChunkIndex: chunk.Chunk.Index,
-        })
-        if err != nil {
-            log.Printf("%v: Error sending response for chunk %d: %v", d.ID, chunk.Chunk.Index, err)
             return err
         }
     }
-
-	// chunk_file_name := fmt.Sprintf("%s_chunk_%d", req.Filename, req.Chunk.Index)
-	// _,err := d.store.Write(req.UserID,req.Filename,chunk_file_name,bytes.NewReader(req.Chunk.Content))
-	
-
-	// var response *transport.UploadChunkResponse;
-
-	// log.Printf("%v : Store state %+v",d.ID, err)
-	// if err ==nil{
-	// 	response = &transport.UploadChunkResponse{
-	// 		Success: true,
-	// 		Message: fmt.Sprintf("Chunk %d uploaded successfully", req.Chunk.Index),
-	// 		ChunkIndex: req.Chunk.Index,
-	// 	}
-	// }else{
-	// 	response = &transport.UploadChunkResponse{
-	// 		Success: false,
-	// 		Message: fmt.Sprintf("Chunk %d uploaded successfully", req.Chunk.Index),
-	// 		ChunkIndex: req.Chunk.Index,
-	// 	}
-	// }
-	// log.Printf("%v : data send response %v",d.ID, response)
-
-    return nil
+    return stream.SendAndClose(&transport.UploadFileResponse{
+        Success: true,
+        Message: "Chunks uploaded successfully",
+    })
 }
 
 

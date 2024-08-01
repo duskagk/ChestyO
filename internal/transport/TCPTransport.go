@@ -75,7 +75,7 @@ func (t *TCPTransport) handleConnection(ctx context.Context, conn net.Conn) {
     for {
         decoder := gob.NewDecoder(conn)
         // encoder := gob.NewEncoder(conn)
-        // log.Printf("%v",encoder) // 에러 처리용
+
         select {
         case <-ctx.Done():
             log.Printf("Context cancelled, closing connection")
@@ -89,30 +89,33 @@ func (t *TCPTransport) handleConnection(ctx context.Context, conn net.Conn) {
                     log.Printf("Connection closed by client")
                     return
                 }
-                log.Printf("TCP : Error receiving message: %v", err)
+                log.Printf("TCP : Error receiving message: %v, %v", err,msg)
                 return
             }
-
-            operationCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+            operationCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
             defer cancel() 
-
             if msg.Category == MessageCategory_REQUEST{
                 switch msg.Operation{
                 case MessageOperation_REGISTER:
-                    
                     resp := t.handleRequestRegister(operationCtx, msg);
                     log.Printf("%v",resp)
                 case MessageOperation_UPLOAD:
-                    
                     if t.isMaster{
-                        resp := t.handleRequestUploadFile(operationCtx, &msg)
+                        resp := t.handleRequestUploadFile(operationCtx, &msg,NewTCPUploadStream(conn))
                         log.Printf("%v",resp)
                     }
                 case MessageOperation_UPLOAD_CHUNK:
                     log.Printf("Upload chunk Case")
+                    if !t.isMaster{
+                        t.dataHandler.UploadFileChunk(operationCtx, NewTCPUploadStream(conn))
+                    }
                 }
             }else if msg.Category == MessageCategory_RESPONSE{
                 switch msg.Operation{
+                case MessageOperation_UPLOAD:
+                    log.Printf("Upload response")
+                case MessageOperation_UPLOAD_CHUNK:
+                    log.Printf("Uploadchunk response")
                 }
             }
         }
@@ -147,13 +150,12 @@ func (t *TCPTransport) handleRequestRegister(ctx context.Context, msg Message) *
     }
 }
 
-func (t *TCPTransport) handleRequestUploadFile(ctx context.Context, msg *Message) *Message{
+func (t *TCPTransport) handleRequestUploadFile(ctx context.Context, msg *Message, stream UploadStream) *Message{
     payload ,ok := msg.Payload.(*RequestPayload)
     if !ok || payload.Upload == nil{
         return createErrorResponse(MessageOperation_UPLOAD, "Invalid register payload")
     }
-
-    err := t.masterHandler.UploadFile(ctx, payload.Upload)
+    err := t.masterHandler.UploadFile(ctx, payload.Upload,stream)
 
     if err !=nil{
         return createErrorResponse(MessageOperation_REGISTER, err.Error())
@@ -163,46 +165,64 @@ func (t *TCPTransport) handleRequestUploadFile(ctx context.Context, msg *Message
 }
 
 
+// TCPUpload Stream
 type TCPUploadStream struct {
     conn    net.Conn
     encoder *gob.Encoder
     decoder *gob.Decoder
 }
 
-func (s *TCPUploadStream) Send(chunk *UploadFileChunk) error {
+func NewTCPUploadStream(conn net.Conn) *TCPUploadStream {
+    return &TCPUploadStream{
+        conn:    conn,
+        encoder: gob.NewEncoder(conn),
+        decoder: gob.NewDecoder(conn),
+    }
+}
+
+func (s *TCPUploadStream) Recv() (*UploadFileChunkRequest, error) {
+    var msg Message
+    err := s.decoder.Decode(&msg)
+    if err != nil {
+        return nil, err
+    }
+    if msg.Operation != MessageOperation_UPLOAD_CHUNK {
+        return nil, fmt.Errorf("unexpected message operation: %v", msg.Operation)
+    }
+    return msg.Payload.(*RequestPayload).UploadChunk, nil
+}
+
+func (s *TCPUploadStream) Send(req *UploadFileChunkRequest) error {
     msg := &Message{
         Category:  MessageCategory_REQUEST,
         Operation: MessageOperation_UPLOAD_CHUNK,
-        Payload: &RequestPayload{
-            UploadChunk: chunk,
-        },
+        Payload:   &RequestPayload{UploadChunk: req},
     }
     return s.encoder.Encode(msg)
 }
 
-func (s *TCPUploadStream) CloseAndRecv() (*UploadChunkResponse, error) {
-    // 스트림 종료 메시지 전송
+func (s *TCPUploadStream) SendAndClose(response *UploadFileResponse) error {
     msg := &Message{
-        Category:  MessageCategory_REQUEST,
-        Operation: MessageOperation_UPLOAD,
-        Payload: &RequestPayload{
-            Upload: &UploadFileRequest{},
-        },
+        Category: MessageCategory_RESPONSE,
+        Operation: MessageOperation_UPLOAD_CHUNK,
+        Payload: &ResponsePayload{Upload : response},
     }
+
     err := s.encoder.Encode(msg)
     if err != nil {
-        return nil, err
+        return err
     }
+    return s.conn.Close()
+}
 
-    // 최종 응답 수신
-    var response Message
-    err = s.decoder.Decode(&response)
+func (s *TCPUploadStream) CloseAndRecv() (*UploadFileResponse, error) {
+    var msg Message
+    err := s.decoder.Decode(&msg)
     if err != nil {
         return nil, err
     }
-
-    if resp, ok := response.Payload.(*ResponsePayload); ok {
-        return resp.UploadChunk, nil
+    if msg.Operation != MessageOperation_UPLOAD {
+        return nil, fmt.Errorf("unexpected message operation: %v", msg.Operation)
     }
-    return nil, fmt.Errorf("unexpected response type")
+    return msg.Payload.(*ResponsePayload).Upload, nil
 }
