@@ -2,17 +2,18 @@ package transport
 
 import (
 	"context"
+	"net"
 )
 
 // transport/transport.go
 type FileService interface {
-	Register(ctx context.Context, req *RegisterMessage) error
+	TCPProtocl(ctx context.Context, conn net.Conn)
 }
 
 type MasterFileService interface{
 	FileService
-    UploadFile(ctx context.Context, req *UploadFileRequest,stream UploadStream) error
-	// DownloadFile(ctx context.Context, req *DownloadFileRequest, stream DownloadStream) error
+    Register(ctx context.Context, req *RegisterMessage) error
+    UploadFile(ctx context.Context, req *UploadFileRequest) error
     DeleteFile(ctx context.Context, req *DeleteFileRequest) (*DeleteFileResponse, error)
     ListFiles(ctx context.Context, req *ListFilesRequest) (*ListFilesResponse, error)
     HasFile(ctx context.Context, userID, filename string) bool
@@ -20,14 +21,15 @@ type MasterFileService interface{
 
 type DataFileService interface {
     FileService
-    UploadFileChunk(ctx context.Context, stream UploadStream) error
+    UploadFileChunk(ctx context.Context, stream TCPStream) error
+    
 }
 
 
-type UploadStream interface {
-	Recv() (*UploadFileChunkRequest, error)
-    Send(*UploadFileChunkRequest) error
-	SendAndClose(*UploadFileResponse) error
-    CloseAndRecv() (*UploadFileResponse, error)
+type TCPStream interface {
+	Recv() (*Message, error)
+    Send(*Message) error
+	SendAndClose(*Message) error
+    CloseAndRecv() (*Message, error)
 }
 

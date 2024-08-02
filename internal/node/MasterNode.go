@@ -7,16 +7,18 @@ import (
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type DataNodeInfo struct {
     ID      string
     Addr    string
-    Conn    net.Conn
+    // Conn    net.Conn
 }
 
 type MasterNode struct {
@@ -39,12 +41,89 @@ func NewMasterNode(id string) *MasterNode {
 	}
 }
 
+func (m *MasterNode)TCPProtocl(ctx context.Context, conn net.Conn){
+    log.Printf("Master Node : get Tcp Protocol")
+    m.handleConnection(ctx,conn)
+}
+
+func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
+    defer conn.Close()
+    decoder := gob.NewDecoder(conn)
+
+    for {
+        select {
+        case <-ctx.Done():
+            log.Printf("Context cancelled, closing connection")
+            return
+        default:
+            var msg transport.Message
+            log.Printf("MasterNode Attempting to decode...")
+            decoder.Decode(&msg)
+
+            log.Printf("Decoding Msg: %v", msg)
+            go func() {
+                opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+                defer cancel()
+
+                if msg.Category == transport.MessageCategory_REQUEST {
+                    switch msg.Operation {
+                    case transport.MessageOperation_REGISTER:
+                        log.Printf("Master Node Message parse")
+                        payload, ok := msg.Payload.(*transport.RequestPayload)
+                        log.Printf("Master Node Message parse ok")
+                        if ok {
+                            err := m.Register(opCtx, payload.Register)
+                            if err != nil {
+                                log.Printf("Register error: %v", err)
+                            }
+                        }
+                    case transport.MessageOperation_UPLOAD:
+                        payload, ok := msg.Payload.(*transport.RequestPayload)
+                        if ok {
+                            log.Printf("Upload Start : %v", payload)
+                            err := m.UploadFile(opCtx, payload.Upload)
+                            var response *transport.Message
+                            if err != nil {
+                                log.Printf("Upload error: %v", err)
+                                response = &transport.Message{
+                                    Category:  transport.MessageCategory_RESPONSE,
+                                    Operation: transport.MessageOperation_UPLOAD,
+                                    Payload: &transport.ResponsePayload{
+                                        Upload: &transport.UploadFileResponse{
+                                            Success: false,
+                                            Message: err.Error(),
+                                        },
+                                    },
+                                }
+                            }else{
+                                response = &transport.Message{
+                                    Category:  transport.MessageCategory_RESPONSE,
+                                    Operation: transport.MessageOperation_UPLOAD,
+                                    Payload: &transport.ResponsePayload{
+                                        Upload: &transport.UploadFileResponse{
+                                            Success: true,
+                                            Message: "File save success",
+                                        },
+                                    },
+                                }
+                            }
+                            transport.SendMessage(conn, response)
+                        }
+                    }
+                }
+
+            }()
+        }
+    }
+}
+
+
 func (m *MasterNode) HasFile(ctx context.Context,userId, filename string) (bool) {
 	return false
 }
 
 // node/master.go
-func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest,stream transport.UploadStream) error {
+func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest) error {
 
 	fileExists := m.HasFile(ctx,req.UserID, req.Filename)
 
@@ -57,48 +136,50 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 			return fmt.Errorf("can't")
 		}
 	} else {
-		return m.handleNewUpload(ctx, req,stream)
+		return m.handleNewUpload(ctx, req)
 	}
 }
 
-func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest, stream transport.UploadStream) error {
+func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadFileRequest) error {
     log.Printf("MasterNode: Handling new upload for file %s from user %s", req.Filename, req.UserID)
 
-    // 파일을 청크로 분할
     chunks := utils.SplitFileIntoChunks(req.Content)
     log.Printf("MasterNode: File split into %d chunks", len(chunks))
 
-    // 청크를 데이터 노드에 분배
     distribution := m.distributeChunks(chunks)
 
-    // 각 데이터 노드에 청크 전송
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(distribution))
+
+    ctx, cancel := context.WithCancel(ctx)
+    defer cancel()
+
     for nodeID, nodeChunks := range distribution {
-        err := m.sendChunksToDataNode(ctx, nodeID, req.UserID, req.Filename, nodeChunks)
+        wg.Add(1)
+        go func(nodeID string, chunks []*transport.FileChunk) {
+            defer wg.Done()
+            if err := m.sendChunksToDataNode(ctx, nodeID, req.UserID, req.Filename, chunks); err != nil {
+                errChan <- err
+                cancel()  // 에러가 발생하면 모든 고루틴 취소
+            }
+        }(nodeID, nodeChunks)
+    }
+
+    go func() {
+        wg.Wait()
+        close(errChan)
+    }()
+
+    for err := range errChan {
         if err != nil {
-            log.Printf("Error sending chunks to node %s: %v", nodeID, err)
+            log.Printf("MasterNode: Error during upload: %v", err)
             return err
         }
     }
 
-    // 파일 위치 정보 업데이트
-    m.mu.Lock()
-    m.fileLocations[req.Filename] = make([]string, 0, len(distribution))
-    for nodeID := range distribution {
-        m.fileLocations[req.Filename] = append(m.fileLocations[req.Filename], nodeID)
-    }
-    m.mu.Unlock()
-
-    // 업로드 완료 응답
-    err := stream.SendAndClose(&transport.UploadFileResponse{
-        Success: true,
-        Message: fmt.Sprintf("File %s uploaded successfully", req.Filename),
-    })
-    if err != nil {
-        log.Printf("Error sending upload response: %v", err)
-        return err
-    }
-
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
+
+
     return nil
 }
 
@@ -110,32 +191,54 @@ func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, f
         return fmt.Errorf("DataNode %s not found", nodeID)
     }
 
-    stream := transport.NewTCPUploadStream(node.Conn)
+    conn, err := net.DialTimeout("tcp", node.Addr, 15*time.Second)
+    if err != nil {
+        return fmt.Errorf("failed to connect to DataNode %s: %v", nodeID, err)
+    }
+    defer conn.Close()
+
+    stream := transport.NewTCPStream(conn)
 
     for i, chunk := range chunks {
-        log.Printf("Sending chunk %d/%d to node %s", i+1, len(chunks), nodeID)
-        err := stream.Send(&transport.UploadFileChunkRequest{
-            UserID:   userID,
-            Filename: filename,
-            Chunk:    *chunk,
-        })
-        if err != nil {
-            log.Printf("Error sending chunk %d to node %s: %v", i+1, nodeID, err)
-            return fmt.Errorf("failed to send chunk %d: %v", i+1, err)
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+            log.Printf("Sending chunk %d/%d to node %s", i+1, len(chunks), nodeID)
+            msg := &transport.Message{
+                Category:  transport.MessageCategory_REQUEST,
+                Operation: transport.MessageOperation_UPLOAD_CHUNK,
+                Payload: &transport.RequestPayload{
+                    UploadChunk: &transport.UploadFileChunkRequest{
+                        UserID:   userID,
+                        Filename: filename,
+                        Chunk:    *chunk,
+                    },
+                },
+            }
+            err := stream.Send(msg)
+            if err != nil {
+                return fmt.Errorf("failed to send chunk %d: %v", i+1, err)
+            }
         }
-        log.Printf("Successfully sent chunk %d/%d to node %s", i+1, len(chunks), nodeID)
     }
 
-    log.Printf("All chunks sent to node %s, waiting for response", nodeID)
     response, err := stream.CloseAndRecv()
     if err != nil {
-        log.Printf("Error receiving response from node %s: %v", nodeID, err)
         return fmt.Errorf("failed to receive response: %v", err)
     }
 
-    if !response.Success {
-        log.Printf("Upload failed for node %s: %s", nodeID, response.Message)
-        return fmt.Errorf("upload failed: %s", response.Message)
+    if response.Category != transport.MessageCategory_RESPONSE || response.Operation != transport.MessageOperation_UPLOAD_CHUNK {
+        return fmt.Errorf("unexpected response: %v", response)
+    }
+
+    payload, ok := response.Payload.(*transport.ResponsePayload)
+    if !ok || payload.UploadChunk == nil {
+        return fmt.Errorf("invalid response payload")
+    }
+
+    if !payload.UploadChunk.Success {
+        return fmt.Errorf("upload failed: %s", payload.UploadChunk.Message)
     }
 
     log.Printf("Successfully uploaded all chunks to node %s", nodeID)
@@ -210,7 +313,7 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
     m.mu.Lock()
     defer m.mu.Unlock()
 
-    conn, err := net.Dial("tcp", req.Addr)
+    _, err := net.Dial("tcp", req.Addr)
     if err != nil {
         return fmt.Errorf("failed to connect to DataNode %s: %v", req.NodeID, err)
     }
@@ -218,7 +321,7 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
     m.dataNodes[req.NodeID] = &DataNodeInfo{
         ID:   req.NodeID,
         Addr: req.Addr,
-        Conn: conn,
+        // Conn: conn,
     }
 
     log.Printf("Registered DataNode: %s at %s", req.NodeID, req.Addr)
@@ -226,6 +329,7 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
 }
 
 func (m *MasterNode) Register(ctx context.Context, req *transport.RegisterMessage) error {
+    log.Printf("Register method")
     return m.handleRegister(req)
 }
 

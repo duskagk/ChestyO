@@ -63,10 +63,119 @@ func (d * DataNode) Stop(){
 	close(d.stopChan)
 }
 
-// node/data.go
-// func (d *DataNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest, createStream func() transport.UploadStream) error {
-// 	return nil;
-// }
+
+func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
+    log.Printf("DataNode %s: Starting TCP protocol", d.ID)
+    defer conn.Close()
+
+    stream := transport.NewTCPStream(conn)
+
+    for {
+        select {
+        case <-ctx.Done():
+            log.Printf("DataNode %s: Context cancelled, closing connection", d.ID)
+            return
+        default:
+            msg, err := stream.Recv()
+            if err != nil {
+                if err == io.EOF {
+                    log.Printf("DataNode %s: Connection closed by peer", d.ID)
+                    return
+                }
+                log.Printf("DataNode %s: Error receiving message: %v", d.ID, err)
+                return
+            }
+
+            log.Printf("DataNode %s: Received message: Category=%v, Operation=%v", d.ID, msg.Category, msg.Operation)
+
+            switch msg.Operation {
+            case transport.MessageOperation_UPLOAD_CHUNK:
+                err = d.handleUploadChunks(ctx, stream, msg)
+            // 여기에 다른 작업 유형을 추가할 수 있습니다.
+            default:
+                log.Printf("DataNode %s: Unknown operation: %v", d.ID, msg.Operation)
+                err = fmt.Errorf("unknown operation")
+            }
+
+            if err != nil {
+                log.Printf("DataNode %s: Error handling operation: %v", d.ID, err)
+                // 에러 응답 보내기
+                errMsg := &transport.Message{
+                    Category:  transport.MessageCategory_RESPONSE,
+                    Operation: msg.Operation,
+                    Payload: &transport.ResponsePayload{
+                        UploadChunk: &transport.UploadChunkResponse{
+                            Success: false,
+                            Message: err.Error(),
+                        },
+                    },
+                }
+                if sendErr := stream.Send(errMsg); sendErr != nil {
+                    log.Printf("DataNode %s: Error sending error response: %v", d.ID, sendErr)
+                }
+                return
+            }
+        }
+    }
+}
+
+func (d *DataNode) handleUploadChunks(ctx context.Context, stream transport.TCPStream, msg *transport.Message) error {
+    payload, ok := msg.Payload.(*transport.RequestPayload)
+    if !ok || payload.UploadChunk == nil {
+        return fmt.Errorf("invalid payload for upload chunk")
+    }
+
+    chunk := payload.UploadChunk
+    log.Printf("DataNode %s: Processing chunk %d for file %s", d.ID, chunk.Chunk.Index, chunk.Filename)
+
+    // Store the chunk
+    chunkFileName := fmt.Sprintf("%s_chunk_%d", chunk.Filename, chunk.Chunk.Index)
+    _, err := d.store.Write(chunk.UserID, chunk.Filename, chunkFileName, bytes.NewReader(chunk.Chunk.Content))
+    if err != nil {
+        return fmt.Errorf("failed to store chunk: %v", err)
+    }
+
+    // Send success response
+    response := &transport.Message{
+        Category:  transport.MessageCategory_RESPONSE,
+        Operation: transport.MessageOperation_UPLOAD_CHUNK,
+        Payload: &transport.ResponsePayload{
+            UploadChunk: &transport.UploadChunkResponse{
+                Success: true,
+                Message: fmt.Sprintf("Chunk %d stored successfully", chunk.Chunk.Index),
+            },
+        },
+    }
+    if err := stream.Send(response); err != nil {
+        return fmt.Errorf("failed to send response: %v", err)
+    }
+
+    return nil
+}
+
+func (d *DataNode) UploadFileChunk(ctx context.Context, stream transport.TCPStream) error {
+    log.Printf("DataNode %s: Starting to receive file chunks", d.ID)
+
+    for {
+        chunk, err := stream.Recv()
+		log.Printf("DataNode %v: chunk %v", d.ID, chunk)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return err
+        }
+
+        // Store the chunk
+        // chunkFileName := fmt.Sprintf("%s_chunk_%d", chunk.Filename, chunk.Chunk.Index)
+        // _, err = d.store.Write(chunk.UserID, chunk.Filename, chunkFileName, bytes.NewReader(chunk.Chunk.Content))
+        // if err != nil {
+        //     return err
+        // }
+    }
+    return nil
+}
+
 
 func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)
@@ -246,30 +355,5 @@ func (m *DataNode) Register(ctx context.Context,req *transport.RegisterMessage) 
 }
 
 
-func (d *DataNode) UploadFileChunk(ctx context.Context, stream transport.UploadStream) error {
-    log.Printf("DataNode %s: Starting to receive file chunks", d.ID)
-
-    for {
-        chunk, err := stream.Recv()
-		log.Printf("DataNode %v: chunk %v", d.ID, chunk)
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            return err
-        }
-
-        // Store the chunk
-        chunkFileName := fmt.Sprintf("%s_chunk_%d", chunk.Filename, chunk.Chunk.Index)
-        _, err = d.store.Write(chunk.UserID, chunk.Filename, chunkFileName, bytes.NewReader(chunk.Chunk.Content))
-        if err != nil {
-            return err
-        }
-    }
-    return stream.SendAndClose(&transport.UploadFileResponse{
-        Success: true,
-        Message: "Chunks uploaded successfully",
-    })
-}
 
 

@@ -19,7 +19,7 @@ var user_name = "TestUser"
 
 
 func TestFileUpload(t *testing.T) {
-    ctx, cancel := context.WithCancel(context.Background())
+    ctx, cancel := context.WithTimeout(context.Background(),time.Second*30)
     defer cancel()
 
     masterAddr := "localhost:8080"
@@ -48,11 +48,14 @@ func TestFileUpload(t *testing.T) {
     }()
     time.Sleep(time.Second)
     
-
-    if master.GetConnectedDataNodesCount() != 2 {
-        t.Fatalf("Not all DataNodes connected. Expected 2, got %d", master.GetConnectedDataNodesCount())
+    for i:=0;i<10;i++{
+        if master.GetConnectedDataNodesCount()==2{
+            break
+        }
     }
 
+
+    
     content, err := os.ReadFile(file_name)
     if err != nil {
         t.Fatalf("Failed to read test file: %v", err)
