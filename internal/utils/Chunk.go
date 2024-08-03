@@ -2,21 +2,22 @@
 
 package utils
 
-import (
-	"ChestyO/internal/transport"
-)
+import "ChestyO/internal/transport"
+
+
 
 const ChunkSize = 50 // 1MB
 
-func SplitFileIntoChunks(content []byte) []transport.FileChunk {
-	var chunks []transport.FileChunk
+func SplitFileIntoChunks(content []byte) []*transport.FileChunk {
+	chunks := make([]*transport.FileChunk, 0, len(content)/ChunkSize+1)
 	for i := 0; i < len(content); i += ChunkSize {
 		end := i + ChunkSize
 		if end > len(content) {
 			end = len(content)
 		}
-		chunks = append(chunks, transport.FileChunk{
+		chunks = append(chunks, &transport.FileChunk{
 			Content: content[i:end],
+			Index:   i / ChunkSize,
 		})
 	}
 	return chunks

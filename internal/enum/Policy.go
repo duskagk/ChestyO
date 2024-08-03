@@ -1,4 +1,4 @@
-package policy
+package enum
 
 type UploadPolicy int
 
