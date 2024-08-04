@@ -91,7 +91,8 @@ func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
             switch msg.Operation {
             case transport.MessageOperation_UPLOAD_CHUNK:
                 err = d.handleUploadChunks(ctx, stream, msg)
-            // 여기에 다른 작업 유형을 추가할 수 있습니다.
+			case transport.MessageOperation_DOWNLOAD_CHUNK:
+				err = d.handleDownloadChunks(ctx,stream, msg)
             default:
                 log.Printf("DataNode %s: Unknown operation: %v", d.ID, msg.Operation)
                 err = fmt.Errorf("unknown operation")
@@ -105,8 +106,10 @@ func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
                     Operation: msg.Operation,
                     Payload: &transport.ResponsePayload{
                         UploadChunk: &transport.UploadChunkResponse{
-                            Success: false,
-                            Message: err.Error(),
+							BaseResponse: transport.BaseResponse{
+								Success: false,
+								Message: err.Error(),
+							},
                         },
                     },
                 }
@@ -118,6 +121,54 @@ func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
         }
     }
 }
+
+func (d *DataNode) handleDownloadChunks(ctx context.Context, stream transport.TCPStream, msg *transport.Message) error {
+    payload, ok := msg.Payload.(*transport.RequestPayload)
+    if !ok || payload.DownLoadChunk == nil {
+        return fmt.Errorf("invalid payload for download chunk")
+    }
+
+    req := payload.DownLoadChunk
+    log.Printf("DataNode %s: Processing download request for file %s, user %s", d.ID, req.Filename, req.UserID)
+
+    chunks, err := d.ReadAllChunks(req.UserID, req.Filename)
+    if err != nil {
+        return fmt.Errorf("failed to read chunks: %v", err)
+    }
+
+    for index, content := range chunks {
+        response := &transport.Message{
+            Category:  transport.MessageCategory_RESPONSE,
+            Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
+            Payload: &transport.ResponsePayload{
+                DownloadChunk: &transport.DownloadChunkResponse{
+                    Chunk: transport.FileChunk{
+                        Index:   index,
+                        Content: content,
+                    },
+                },
+            },
+        }
+        if err := stream.Send(response); err != nil {
+            return fmt.Errorf("failed to send chunk response: %v", err)
+        }
+    }
+
+    // 모든 청크를 전송한 후 스트림 종료
+    return stream.SendAndClose(&transport.Message{
+        Category:  transport.MessageCategory_RESPONSE,
+        Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
+        Payload: &transport.ResponsePayload{
+            DownloadChunk: &transport.DownloadChunkResponse{
+                BaseResponse: transport.BaseResponse{
+                    Success: true,
+                    Message: "All chunks sent",
+                },
+            },
+        },
+    })
+}
+
 
 func (d *DataNode) handleUploadChunks(ctx context.Context, stream transport.TCPStream, msg *transport.Message) error {
     payload, ok := msg.Payload.(*transport.RequestPayload)
@@ -141,9 +192,13 @@ func (d *DataNode) handleUploadChunks(ctx context.Context, stream transport.TCPS
         Operation: transport.MessageOperation_UPLOAD_CHUNK,
         Payload: &transport.ResponsePayload{
             UploadChunk: &transport.UploadChunkResponse{
-                Success: true,
-                Message: fmt.Sprintf("Chunk %d stored successfully", chunk.Chunk.Index),
+				BaseResponse: transport.BaseResponse{
+					Success: true,
+					Message: fmt.Sprintf("Chunk %d stored successfully", chunk.Chunk.Index),
+				},
+				ChunkIndex: payload.UploadChunk.Chunk.Index,
             },
+			
         },
     }
     if err := stream.Send(response); err != nil {
@@ -153,28 +208,7 @@ func (d *DataNode) handleUploadChunks(ctx context.Context, stream transport.TCPS
     return nil
 }
 
-func (d *DataNode) UploadFileChunk(ctx context.Context, stream transport.TCPStream) error {
-    log.Printf("DataNode %s: Starting to receive file chunks", d.ID)
 
-    for {
-        chunk, err := stream.Recv()
-		log.Printf("DataNode %v: chunk %v", d.ID, chunk)
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            return err
-        }
-
-        // Store the chunk
-        // chunkFileName := fmt.Sprintf("%s_chunk_%d", chunk.Filename, chunk.Chunk.Index)
-        // _, err = d.store.Write(chunk.UserID, chunk.Filename, chunkFileName, bytes.NewReader(chunk.Chunk.Content))
-        // if err != nil {
-        //     return err
-        // }
-    }
-    return nil
-}
 
 
 func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
@@ -186,10 +220,6 @@ func RunDataNode(ctx context.Context,id, addr, masterAddr string) error {
     return dataNode.Start(ctx,addr, masterAddr)
 }
 
-// DownloadFile downloads a file from the distributed system
-func (d *DataNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) error {
-	return nil
-}
 
 // DeleteFile deletes a file from the distributed system
 func (d *DataNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
@@ -204,8 +234,10 @@ func (d *DataNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequ
 		if os.IsNotExist(err) {
 			log.Printf("DataNode %s: Directory not found for file %s", d.ID, req.Filename)
 			return &transport.DeleteFileResponse{
-				Success: false,
-				Message: fmt.Sprintf("File %s not found", req.Filename),
+				BaseResponse: transport.BaseResponse{
+					Success: false,
+					Message: fmt.Sprintf("File %s not found", req.Filename),
+				},
 			}, nil
 		}
 		return nil, fmt.Errorf("error reading directory: %v", err)
@@ -231,8 +263,10 @@ func (d *DataNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequ
 
 	log.Printf("DataNode %s: Deleted %d chunks for file %s", d.ID, deletedCount, req.Filename)
 	return &transport.DeleteFileResponse{
-		Success: true,
-		Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+		BaseResponse: transport.BaseResponse{
+			Success: true,
+			Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+		},
 	}, nil
 }
 
@@ -255,7 +289,7 @@ func (d *DataNode) ListFiles(ctx context.Context, req *transport.ListFilesReques
 	}
 
 	return &transport.ListFilesResponse{
-		Files: fileInfos,
+		
 	}, nil
 }
 

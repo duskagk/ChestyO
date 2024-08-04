@@ -17,12 +17,11 @@ type MasterFileService interface{
     DeleteFile(ctx context.Context, req *DeleteFileRequest) (*DeleteFileResponse, error)
     ListFiles(ctx context.Context, req *ListFilesRequest) (*ListFilesResponse, error)
     HasFile(ctx context.Context, userID, filename string) bool
+    DownloadFile(ctx context.Context, req *DownloadFileRequest, conn net.Conn) error
 }
 
 type DataFileService interface {
     FileService
-    UploadFileChunk(ctx context.Context, stream TCPStream) error
-    
 }
 
 

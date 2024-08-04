@@ -9,8 +9,10 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"sort"
 	"sync"
 	"time"
 )
@@ -88,8 +90,10 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                                     Operation: transport.MessageOperation_UPLOAD,
                                     Payload: &transport.ResponsePayload{
                                         Upload: &transport.UploadFileResponse{
-                                            Success: false,
-                                            Message: err.Error(),
+                                            BaseResponse: transport.BaseResponse{
+                                                Success: false,
+                                                Message: err.Error(),
+                                            },
                                         },
                                     },
                                 }
@@ -99,14 +103,22 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                                     Operation: transport.MessageOperation_UPLOAD,
                                     Payload: &transport.ResponsePayload{
                                         Upload: &transport.UploadFileResponse{
-                                            Success: true,
-                                            Message: "File save success",
+                                            BaseResponse: transport.BaseResponse{
+                                                Success: true,
+                                                Message: "File save success",
+                                            },
                                         },
                                     },
                                 }
                             }
                             transport.SendMessage(conn, response)
                         }
+                    case transport.MessageOperation_DOWNLOAD:
+                        payload, ok := msg.Payload.(*transport.RequestPayload)
+                        if ok{
+                            m.DownloadFile(opCtx, payload.Download, conn)
+                        }
+                    default:
                     }
                 }
 
@@ -180,6 +192,136 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 
     return nil
 }
+
+
+func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, conn net.Conn) error {
+    log.Printf("MasterNode: Starting download for file %s from user %s", req.Filename, req.UserID)
+
+    stream := transport.NewTCPStream(conn)
+
+    // 모든 DataNode에 다운로드 요청 전송
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(m.dataNodes))
+    chunksChan := make(chan *transport.FileChunk, 100*100) // 버퍼 크기는 적절히 조정
+
+    for _, node := range m.dataNodes {
+        wg.Add(1)
+        go func(nodeID, addr string) {
+            defer wg.Done()
+            err := m.requestChunksFromDataNode(ctx, nodeID, addr, req.UserID, req.Filename, chunksChan)
+            if err != nil {
+                errChan <- err
+            }
+        }(node.ID, node.Addr)
+    }
+
+    // 청크 수집
+    go func() {
+        wg.Wait()
+        close(chunksChan)
+        close(errChan)
+    }()
+
+    // 청크를 수집하여 완전한 파일로 만들기
+    chunks := make(map[int][]byte)
+    for chunk := range chunksChan {
+        chunks[chunk.Index] = chunk.Content
+    }
+
+    // 에러 확인
+    for err := range errChan {
+        if err != nil {
+            return fmt.Errorf("error during download: %v", err)
+        }
+    }
+
+    // 청크를 정렬하고 합치기
+    var sortedIndices []int
+    for index := range chunks {
+        sortedIndices = append(sortedIndices, int(index))
+    }
+    sort.Ints(sortedIndices)
+
+    var fullFileContent []byte
+    for _, index := range sortedIndices {
+        fullFileContent = append(fullFileContent, chunks[int(index)]...)
+    }
+
+    // 클라이언트에게 전체 파일 전송
+    response := &transport.Message{
+        Category:  transport.MessageCategory_RESPONSE,
+        Operation: transport.MessageOperation_DOWNLOAD,
+        Payload: &transport.ResponsePayload{
+            Download: &transport.DownloadFileResponse{
+                BaseResponse: transport.BaseResponse{
+                    Success: true,
+                    Message: "다운로드 성공",
+                },
+                FileContent: fullFileContent,
+            },
+        },
+    }
+    if err := stream.Send(response); err != nil {
+        return fmt.Errorf("failed to send file to client: %v", err)
+    }
+
+    log.Printf("MasterNode: Successfully downloaded and sent file %s for user %s", req.Filename, req.UserID)
+    return nil
+}
+
+func (m *MasterNode) requestChunksFromDataNode(ctx context.Context, nodeID, addr, userID, filename string, chunksChan chan<- *transport.FileChunk) error {
+    conn, err := net.Dial("tcp", addr)
+    if err != nil {
+        return fmt.Errorf("failed to connect to DataNode %s: %v", nodeID, err)
+    }
+    defer conn.Close()
+
+    stream := transport.NewTCPStream(conn)
+
+    request := &transport.Message{
+        Category:  transport.MessageCategory_REQUEST,
+        Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
+        Payload: &transport.RequestPayload{
+            DownLoadChunk: &transport.DownloadChunkRequest{
+                UserID:   userID,
+                Filename: filename,
+            },
+        },
+    }
+
+    if err := stream.Send(request); err != nil {
+        return fmt.Errorf("failed to send download request to DataNode %s: %v", nodeID, err)
+    }
+
+    log.Printf("Start Get Data %s", nodeID)
+    for {
+        response, err := stream.Recv()
+        if err == io.EOF {
+            log.Printf("The stream from DataNode %s is end", nodeID)
+            break
+        }
+        if err != nil {
+            return fmt.Errorf("error receiving chunk from DataNode %s: %v", nodeID, err)
+        }
+
+        if response.Category == transport.MessageCategory_RESPONSE && response.Operation == transport.MessageOperation_DOWNLOAD_CHUNK {
+            payload, ok := response.Payload.(*transport.ResponsePayload)
+            if !ok || payload.DownloadChunk == nil {
+                return fmt.Errorf("invalid payload for download chunk from DataNode %s", nodeID)
+            }
+            if payload.DownloadChunk.Success && payload.DownloadChunk.Message == "All chunks sent" {
+                log.Printf("All chunks received from DataNode %s", nodeID)
+                break
+            }
+            log.Printf("Receive Data %v", &payload.DownloadChunk.Chunk)
+            chunksChan <- &payload.DownloadChunk.Chunk
+        }
+    }
+
+    return nil
+}
+
+
 
 func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, filename string, chunks []*transport.FileChunk) error {
     log.Printf("Starting to send %d chunks to node %s for file %s", len(chunks), nodeID, filename)
@@ -269,22 +411,22 @@ func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, f
 }
 
 
-func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) error {
-	return fmt.Errorf("file not found: %s", req.Filename)
-}
-
 func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
 	exists := m.HasFile(ctx,req.UserID, req.Filename)
 	if !exists {
 		return &transport.DeleteFileResponse{
-			Success: false,
-			Message: fmt.Sprintf("File %s not found", req.Filename),
+            BaseResponse: transport.BaseResponse{
+                Success: false,
+                Message: fmt.Sprintf("File %s not found", req.Filename),
+            },
 		}, nil
 	}
 
 	return &transport.DeleteFileResponse{
-        Success: true,
-        Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+        BaseResponse: transport.BaseResponse{
+            Success: true,
+            Message: fmt.Sprintf("File %s successfully deleted", req.Filename),
+        },
     }, nil
 }
 
@@ -393,3 +535,8 @@ func (m *MasterNode) GetConnectedDataNodesCount() int {
     defer m.mu.RUnlock()
     return len(m.dataNodes)
 }
+
+
+
+
+

@@ -3,9 +3,6 @@ package transport
 import (
 	"ChestyO/internal/enum"
 	"encoding/gob"
-	"log"
-	"net"
-	"strings"
 )
 
 type MessageCategory int
@@ -24,6 +21,7 @@ const (
     MessageOperation_DELETE
     MessageOperation_LIST
     MessageOperation_UPLOAD_CHUNK
+    MessageOperation_DOWNLOAD_CHUNK
 )
 
 type Message struct {
@@ -39,6 +37,7 @@ type RequestPayload struct {
     Delete         *DeleteFileRequest
     List           *ListFilesRequest
     UploadChunk    *UploadFileChunkRequest
+    DownLoadChunk  *DownloadChunkRequest
 }
 
 type ResponsePayload struct {
@@ -48,37 +47,7 @@ type ResponsePayload struct {
     Delete         *DeleteFileResponse
     List           *ListFilesResponse
     UploadChunk    *UploadChunkResponse
-    Success        *SuccessResponse
-    Error          *ErrorResponse
-}
-
-
-func SendMessage(conn net.Conn, msg *Message) error {
-    log.Printf("SendMessage : %v\n",msg)
-    encoder := gob.NewEncoder(conn)
-    err := encoder.Encode(msg)
-    if err != nil {
-        log.Printf("Error encoding message: %v", err)
-        if netErr, ok := err.(net.Error); ok {
-            log.Printf("Network error: timeout=%v, temporary=%v", netErr.Timeout(), netErr.Temporary())
-        }
-    }
-    return err
-}
-
-func ReceiveMessage(conn net.Conn) (*Message, error) {
-    decoder := gob.NewDecoder(conn)
-    msg := &Message{}
-    err := decoder.Decode(msg)
-    if err != nil {
-        if strings.Contains(err.Error(), "duplicate type received") {
-            // 중복 타입 에러 무시 또는 로깅
-            log.Printf("Warning: Duplicate type received, ignoring: %v", err)
-            return nil, nil
-        }
-        return nil, err
-    }
-    return msg, nil
+    DownloadChunk  *DownloadChunkResponse
 }
 
 // Request and Response types
@@ -90,19 +59,22 @@ type UploadFileRequest struct {
     Content   []byte
 }
 
-type RegisterResponse struct {
+type BaseResponse struct {
     Success bool
-	Message string
+    Message string
+}
+
+type RegisterResponse struct {
+    BaseResponse
 }
 
 type UploadFileResponse struct {
-	Success bool
-	Message string
+    BaseResponse
 }
 
 type DownloadFileResponse struct {
-	Success bool
-	Message string
+    BaseResponse
+    FileContent []byte
 }
 
 
@@ -117,8 +89,7 @@ type DeleteFileRequest struct {
 }
 
 type DeleteFileResponse struct {
-	Success bool
-	Message string
+    BaseResponse
 }
 
 type ListFilesRequest struct {
@@ -126,9 +97,7 @@ type ListFilesRequest struct {
 }
 
 type ListFilesResponse struct {
-    Files   []FileInfo
-    Success bool
-    Message string
+    BaseResponse
 }
 
 
@@ -137,6 +106,12 @@ type UploadFileChunkRequest struct {
 	Filename  string
     Chunk     FileChunk
 }
+
+type DownloadChunkRequest struct{
+    UserID     string
+    Filename   string
+}
+
 type FileChunk struct {
 	Content []byte
 	Index   int
@@ -171,46 +146,19 @@ type HasFileRequest struct {
 }
 
 type HasFileResponse struct {
-    Exists bool
+    BaseResponse
 }
 
 type UploadChunkResponse struct {
-    Success    bool
-    Message    string
+    BaseResponse
     ChunkIndex int
 }
 
-type ErrorResponse struct {
-    Message     string
+type DownloadChunkResponse struct{
+    BaseResponse
+    Chunk FileChunk
 }
 
-type SuccessResponse struct{
-    Message     string
-}
-
-func createErrorResponse(operation MessageOperation, errMsg string) *Message {
-    return &Message{
-        Category:  MessageCategory_RESPONSE,
-        Operation: operation,
-        Payload: &ResponsePayload{
-            Error: &ErrorResponse{
-                Message: errMsg,
-            },
-        },
-    }
-}
-
-func createSuccessResponse(operation MessageOperation, msg string) *Message {
-    return &Message{
-        Category:  MessageCategory_RESPONSE,
-        Operation: operation,
-        Payload: &ResponsePayload{
-            Success: &SuccessResponse{
-                Message: msg,
-            },
-        },
-    }
-}
 
 
 func init() {
@@ -220,5 +168,4 @@ func init() {
     gob.Register(&FileChunk{})
     gob.Register(UploadFileResponse{})
     gob.Register(UploadFileChunkRequest{})
-    // gob.Register(UploadStream{})
 }
