@@ -128,14 +128,79 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 
-func (m *MasterNode) HasFile(ctx context.Context,userId, filename string) (bool) {
-	return false
+func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, map[string]bool) {
+    responses := make(map[string]bool)
+    var mu sync.Mutex
+    var wg sync.WaitGroup
+
+    for nodeID, node := range m.dataNodes {
+        wg.Add(1)
+        go func(nodeID, addr string) {
+            defer wg.Done()
+            hasFile, err := m.checkFileInDataNode(ctx, addr, userID, filename)
+            if err != nil {
+                log.Printf("Error checking file in node %s: %v", nodeID, err)
+                return
+            }
+            mu.Lock()
+            responses[nodeID] = hasFile
+            mu.Unlock()
+        }(nodeID, node.Addr)
+    }
+
+    wg.Wait()
+
+    hasFile := false
+    for _, exists := range responses {
+        if exists {
+            hasFile = true
+            break
+        }
+    }
+
+    return hasFile, responses
+}
+
+func (m *MasterNode) checkFileInDataNode(ctx context.Context,addr,user_id, filename string) (bool,error){
+    log.Printf("MasterNode: check for file %s from user %s",filename, user_id)
+    ctx, cancel := context.WithCancel(ctx)
+    conn, err := net.Dial("tcp", addr)
+    defer cancel()
+    
+
+    if err!=nil{
+        return false, err
+    }
+
+    stream := transport.NewTCPStream(conn)
+
+    request := &transport.Message{
+        Category:  transport.MessageCategory_REQUEST,
+        Operation: transport.MessageOperation_HASFILE,
+        Payload: &transport.RequestPayload{
+            HasFile: &transport.HasFileRequest{
+                UserID:   user_id,
+                Filename: filename,
+            },
+        },
+    }
+    if err :=stream.Send(request); err!=nil{
+        return false, err
+    }
+    msg,err := stream.Recv()
+    payload, ok := msg.Payload.(*transport.ResponsePayload)
+
+    if !ok{
+        return false, fmt.Errorf("Not correct response")
+    }
+
+    return payload.HasFile.IsExist, nil
 }
 
 // node/master.go
 func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest) error {
 
-	fileExists := m.HasFile(ctx,req.UserID, req.Filename)
+	fileExists,_ := m.HasFile(ctx,req.UserID, req.Filename)
 
 	if fileExists {
 		switch req.Policy {
@@ -412,7 +477,7 @@ func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, f
 
 
 func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest) (*transport.DeleteFileResponse, error) {
-	exists := m.HasFile(ctx,req.UserID, req.Filename)
+	exists,_ := m.HasFile(ctx,req.UserID, req.Filename)
 	if !exists {
 		return &transport.DeleteFileResponse{
             BaseResponse: transport.BaseResponse{
@@ -535,7 +600,6 @@ func (m *MasterNode) GetConnectedDataNodesCount() int {
     defer m.mu.RUnlock()
     return len(m.dataNodes)
 }
-
 
 
 

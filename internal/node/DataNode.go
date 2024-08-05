@@ -93,6 +93,8 @@ func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
                 err = d.handleUploadChunks(ctx, stream, msg)
 			case transport.MessageOperation_DOWNLOAD_CHUNK:
 				err = d.handleDownloadChunks(ctx,stream, msg)
+			case transport.MessageOperation_HASFILE:
+				err = d.handleHasFile(ctx, stream, msg)
             default:
                 log.Printf("DataNode %s: Unknown operation: %v", d.ID, msg.Operation)
                 err = fmt.Errorf("unknown operation")
@@ -208,6 +210,43 @@ func (d *DataNode) handleUploadChunks(ctx context.Context, stream transport.TCPS
     return nil
 }
 
+func (d *DataNode) handleHasFile(ctx context.Context, stream transport.TCPStream, msg *transport.Message) error{
+	payload, ok := msg.Payload.(*transport.RequestPayload)
+
+	if!ok{
+		response := &transport.Message{
+			Category:  transport.MessageCategory_RESPONSE,
+			Operation: transport.MessageOperation_UPLOAD_CHUNK,
+			Payload: &transport.ResponsePayload{
+				HasFile: &transport.HasFileResponse{
+					BaseResponse: transport.BaseResponse{
+						Success: false,
+						Message: "Response not valid",
+					},
+					IsExist: false,
+				},
+			},
+		}
+		stream.SendAndClose(response)
+		return fmt.Errorf("error not valid %v",d.ID)
+	}
+	is_exist :=d.HasFile(ctx,payload.HasFile.UserID,payload.HasFile.UserID)
+	response := &transport.Message{
+        Category:  transport.MessageCategory_RESPONSE,
+        Operation: transport.MessageOperation_UPLOAD_CHUNK,
+        Payload: &transport.ResponsePayload{
+            HasFile: &transport.HasFileResponse{
+				BaseResponse: transport.BaseResponse{
+					Success: true,
+					Message: "Find file result",
+				},
+				IsExist: is_exist,
+            },
+        },
+    }
+	stream.SendAndClose(response)
+	return nil
+}
 
 
 
