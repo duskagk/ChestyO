@@ -66,7 +66,7 @@ func (d * DataNode) Stop(){
 
 func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
     log.Printf("DataNode %s: Starting TCP protocol", d.ID)
-    defer conn.Close()
+    // defer conn.Close()
 
     stream := transport.NewTCPStream(conn)
 
@@ -93,6 +93,20 @@ func (d *DataNode) TCPProtocl(ctx context.Context, conn net.Conn) {
                 err = d.handleUploadChunks(ctx, stream, msg)
 			case transport.MessageOperation_DOWNLOAD_CHUNK:
 				err = d.handleDownloadChunks(ctx,stream, msg)
+			case transport.MessageOperation_HASFILE:
+				err = d.handleHasFile(ctx, stream, msg)
+				if err != nil {
+					log.Printf("DataNode %s: Error handling HasFile: %v", d.ID, err)
+					return
+				}
+				return
+			case transport.MessageOperation_DELETE:
+				err = d.handleDeleteFile(ctx ,stream,msg)
+				if err != nil{
+					log.Printf("DataNode %s: Error handling Delet : %v", d.ID,err)
+					return
+				}
+				return
             default:
                 log.Printf("DataNode %s: Unknown operation: %v", d.ID, msg.Operation)
                 err = fmt.Errorf("unknown operation")
@@ -208,6 +222,103 @@ func (d *DataNode) handleUploadChunks(ctx context.Context, stream transport.TCPS
     return nil
 }
 
+func (d *DataNode) handleHasFile(ctx context.Context, stream transport.TCPStream, msg *transport.Message) error {
+    payload, ok := msg.Payload.(*transport.RequestPayload)
+
+    if !ok || payload.HasFile == nil {
+        response := &transport.Message{
+            Category:  transport.MessageCategory_RESPONSE,
+            Operation: transport.MessageOperation_HASFILE,  // 수정됨
+            Payload: &transport.ResponsePayload{
+                HasFile: &transport.HasFileResponse{
+                    BaseResponse: transport.BaseResponse{
+                        Success: false,
+                        Message: "Response not valid",
+                    },
+                    IsExist: false,
+                },
+            },
+        }
+        return stream.SendAndClose(response)
+    }
+    is_exist := d.HasFile(ctx, payload.HasFile.UserID, payload.HasFile.Filename)  // Filename으로 수정
+    response := &transport.Message{
+        Category:  transport.MessageCategory_RESPONSE,
+        Operation: transport.MessageOperation_HASFILE,  // 수정됨
+        Payload: &transport.ResponsePayload{
+            HasFile: &transport.HasFileResponse{
+                BaseResponse: transport.BaseResponse{
+                    Success: true,
+                    Message: "Find file result",
+                },
+                IsExist: is_exist,
+            },
+        },
+    }
+    return stream.SendAndClose(response)
+}
+
+func (d *DataNode) handleDeleteFile(ctx context.Context, stream transport.TCPStream, msg *transport.Message) error {
+	log.Printf("Node %s : handle delete file start",d.ID)
+    payload, ok := msg.Payload.(*transport.RequestPayload)
+    
+    if !ok || payload.Delete == nil {
+        response := &transport.Message{
+            Category:  transport.MessageCategory_RESPONSE,
+            Operation: transport.MessageOperation_DELETE,
+            Payload: &transport.ResponsePayload{
+                Delete: &transport.DeleteFileResponse{
+                    BaseResponse: transport.BaseResponse{
+                        Success: false,
+                        Message: "Invalid request payload",
+                    },
+                },
+            },
+        }
+        if err := stream.Send(response); err != nil {
+            return fmt.Errorf("failed to send error response: %v", err)
+        }
+        return fmt.Errorf("invalid request payload")
+    }
+
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+        err := d.store.Delete(payload.Delete.UserID, payload.Delete.Filename)
+
+        success := err == nil
+        message := "Delete successful"
+        if err != nil {
+            message = fmt.Sprintf("Delete failed: %v", err)
+        }
+
+        response := &transport.Message{
+            Category:  transport.MessageCategory_RESPONSE,
+            Operation: transport.MessageOperation_DELETE,
+            Payload: &transport.ResponsePayload{
+                Delete: &transport.DeleteFileResponse{
+                    BaseResponse: transport.BaseResponse{
+                        Success: success,
+                        Message: message,
+                    },
+                },
+            },
+        }
+
+        if sendErr := stream.SendAndClose(response); sendErr != nil {
+            return fmt.Errorf("failed to send response: %v", sendErr)
+        }
+
+        if success {
+            log.Printf("DataNode: Deleted file %s for user %s", payload.Delete.Filename, payload.Delete.UserID)
+        } else {
+            log.Printf("DataNode: Failed to delete file %s for user %s: %v", payload.Delete.Filename, payload.Delete.UserID, err)
+        }
+
+        return err
+    }
+}
 
 
 

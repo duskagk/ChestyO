@@ -207,3 +207,92 @@ func TestFileDownload(t *testing.T) {
 
     log.Printf("Download successful: File size: %d bytes", len(downloadedContent))
 }
+
+
+func TestFileDelete(t *testing.T) {
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+    defer cancel()
+
+    masterAddr := "localhost:8080"
+    dataAddr1 := "localhost:8081"
+    dataAddr2 := "localhost:8082"
+
+    // MasterNode 시작
+    master := node.NewMasterNode("master1")
+    go func() {
+        if err := master.Start(ctx, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run MasterNode: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+
+    // DataNode 시작
+    go func() {
+        if err := node.RunDataNode(ctx, "data1", dataAddr1, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode1: %v", err)
+        }
+    }()
+
+    go func() {
+        if err := node.RunDataNode(ctx, "data2", dataAddr2, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode2: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+    
+    for i := 0; i < 10; i++ {
+        if master.GetConnectedDataNodesCount() == 2 {
+            break
+        }
+        time.Sleep(time.Second)
+    }
+
+    // MasterNode에 연결
+    conn, err := net.Dial("tcp", masterAddr)
+    if err != nil {
+        t.Fatalf("Failed to connect to MasterNode: %v", err)
+    }
+    defer conn.Close()
+
+    // 삭제 요청 전송
+    deleteRequest := &transport.Message{
+        Category:  transport.MessageCategory_REQUEST,
+        Operation: transport.MessageOperation_DELETE,
+        Payload: &transport.RequestPayload{
+            Delete: &transport.DeleteFileRequest{
+                UserID:   user_name,
+                Filename: file_name,
+            },
+        },
+    }
+    err = transport.SendMessage(conn, deleteRequest)
+    if err != nil {
+        t.Fatalf("Failed to send delete request: %v", err)
+    }
+
+    // 응답 수신
+    response, err := transport.ReceiveMessage(conn)
+    if err != nil {
+        t.Fatalf("Failed to receive delete response: %v", err)
+    }
+
+    // 응답 확인
+    payload, ok := response.Payload.(*transport.ResponsePayload)
+    if !ok || payload.Delete == nil {
+        t.Fatalf("Invalid delete response")
+    }
+
+    if !payload.Delete.Success {
+        t.Fatalf("Delete operation failed: %s", payload.Delete.Message)
+    }
+
+    log.Printf("Delete request sent successfully and received positive response")
+
+    // 파일이 실제로 삭제되었는지 확인 (선택적)
+    exists, _ := master.HasFile(ctx, user_name, file_name)
+    if exists {
+        t.Fatalf("File still exists after deletion")
+    }
+
+    log.Printf("File delete test passed successfully")
+}

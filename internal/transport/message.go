@@ -18,6 +18,7 @@ const (
     MessageOperation_REGISTER MessageOperation = iota
     MessageOperation_UPLOAD
     MessageOperation_DOWNLOAD
+    MessageOperation_HASFILE
     MessageOperation_DELETE
     MessageOperation_LIST
     MessageOperation_UPLOAD_CHUNK
@@ -34,6 +35,7 @@ type RequestPayload struct {
     Register       *RegisterMessage
     Upload         *UploadFileRequest
     Download       *DownloadFileRequest
+    HasFile        *HasFileRequest
     Delete         *DeleteFileRequest
     List           *ListFilesRequest
     UploadChunk    *UploadFileChunkRequest
@@ -44,6 +46,7 @@ type ResponsePayload struct {
     Register       *RegisterResponse
     Upload         *UploadFileResponse
     Download       *DownloadFileResponse
+    HasFile        *HasFileResponse
     Delete         *DeleteFileResponse
     List           *ListFilesResponse
     UploadChunk    *UploadChunkResponse
@@ -147,6 +150,7 @@ type HasFileRequest struct {
 
 type HasFileResponse struct {
     BaseResponse
+    IsExist  bool
 }
 
 type UploadChunkResponse struct {
