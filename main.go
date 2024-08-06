@@ -13,7 +13,8 @@ import (
 func main() {
     nodeType := flag.String("type", "", "Type of node: 'master' or 'data'")
     nodeID := flag.String("id", "", "ID of the node")
-    listenAddr := flag.String("addr", "", "Address to listen on")
+    tcpAddr := flag.String("tcp", "", "TCP address to listen on")
+    httpAddr := flag.String("http", "", "HTTP address to listen on (for master node)")
     masterAddr := flag.String("master", "", "Address of the master node (for data nodes)")
     flag.Parse()
 
@@ -31,9 +32,16 @@ func main() {
     var err error
     switch *nodeType {
     case "master":
-        err = node.RunMasterNode(ctx, *nodeID, *listenAddr)
+        if *httpAddr == "" {
+            log.Fatal("HTTP address is required for master node")
+        }
+        masterNode := node.NewMasterNode(*nodeID, *tcpAddr, *httpAddr)
+        err = masterNode.Start(ctx)
     case "data":
-        err = node.RunDataNode(ctx, *nodeID, *listenAddr, *masterAddr)
+        if *masterAddr == "" {
+            log.Fatal("Master address is required for data node")
+        }
+        err = node.RunDataNode(ctx, *nodeID, *tcpAddr, *masterAddr)
     default:
         log.Fatal("Invalid node type. Use 'master' or 'data'")
     }

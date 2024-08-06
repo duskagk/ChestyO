@@ -4,6 +4,7 @@ package node
 
 import (
 	policy "ChestyO/internal/enum"
+	"ChestyO/internal/rest"
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
 	"context"
@@ -28,19 +29,31 @@ type MasterNode struct {
     dataNodes     map[string]*DataNodeInfo
     fileLocations map[string][]string
     userMutexes   sync.Map
-    transport     *transport.TCPTransport
+    tcpTransport     *transport.TCPTransport
     mu            sync.RWMutex
+    restServer      *rest.RestServer
     stopChan      chan struct{}
 }
 
-func NewMasterNode(id string) *MasterNode {
-	return &MasterNode{
-		ID:            id,
-		dataNodes:     make(map[string]*DataNodeInfo),
-		fileLocations: make(map[string][]string),
-		userMutexes: sync.Map{},
-        stopChan: make(chan struct{}),
-	}
+func NewMasterNode(id,tcpAddr, httpAddr string) *MasterNode {
+    m := &MasterNode{
+        ID:            id,
+        dataNodes:     make(map[string]*DataNodeInfo),
+        fileLocations: make(map[string][]string),
+        userMutexes:   sync.Map{},
+        stopChan:      make(chan struct{}),
+    }
+    
+    transport, err := transport.NewTCPTransport(tcpAddr, m)
+    if err != nil {
+        return nil
+    }
+    m.tcpTransport = transport
+    
+    // RestServer 생성
+    m.restServer = rest.NewServer(m, httpAddr)
+
+    return m
 }
 
 func (m *MasterNode)TCPProtocl(ctx context.Context, conn net.Conn){
@@ -77,6 +90,7 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                                 log.Printf("Register error: %v", err)
                             }
                         }
+                        return
                     case transport.MessageOperation_UPLOAD:
                         if ok {
                             log.Printf("Upload Start : %v", payload)
@@ -112,10 +126,44 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                             }
                             transport.SendMessage(conn, response)
                         }
+                        return
                     case transport.MessageOperation_DOWNLOAD:
                         if ok{
-                            m.DownloadFile(opCtx, payload.Download, conn)
+                            file,err := m.DownloadFile(opCtx, payload.Download)
+                            stream := transport.NewTCPStream(conn)
+                            var response *transport.Message 
+                            if err!=nil{
+                                response = &transport.Message{
+                                    Category:  transport.MessageCategory_RESPONSE,
+                                    Operation: transport.MessageOperation_DOWNLOAD,
+                                    Payload: &transport.ResponsePayload{
+                                        Download: &transport.DownloadFileResponse{
+                                            BaseResponse: transport.BaseResponse{
+                                                Success: false,
+                                                Message: err.Error(),
+                                            },
+                                            FileContent: file,
+                                        },
+                                    },
+                                }
+                            }else{
+                                response = &transport.Message{
+                                    Category:  transport.MessageCategory_RESPONSE,
+                                    Operation: transport.MessageOperation_DOWNLOAD,
+                                    Payload: &transport.ResponsePayload{
+                                        Download: &transport.DownloadFileResponse{
+                                            BaseResponse: transport.BaseResponse{
+                                                Success: true,
+                                                Message: "다운로드 성공",
+                                            },
+                                            FileContent: file,
+                                        },
+                                    },
+                                }
+                            }
+                            stream.Send(response);
                         }
+                        return
                     case transport.MessageOperation_DELETE:
                         if ok{
                             err := m.DeleteFile(opCtx, payload.Delete)
@@ -133,7 +181,6 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                                     },
                                 }
                                 transport.SendMessage(conn, response)
-                                return
                             }else{
                                 response := &transport.Message{
                                     Category:  transport.MessageCategory_RESPONSE,
@@ -148,8 +195,8 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                                     },
                                 }
                                 transport.SendMessage(conn, response)
-                                return
                             }
+                            return
                         }
                     default:
                     }
@@ -295,10 +342,10 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 }
 
 
-func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest, conn net.Conn) error {
+func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) ([]byte,error) {
     log.Printf("MasterNode: Starting download for file %s from user %s", req.Filename, req.UserID)
 
-    stream := transport.NewTCPStream(conn)
+    // stream := transport.NewTCPStream(conn)
 
     // 모든 DataNode에 다운로드 요청 전송
     var wg sync.WaitGroup
@@ -332,7 +379,7 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
     // 에러 확인
     for err := range errChan {
         if err != nil {
-            return fmt.Errorf("error during download: %v", err)
+            return nil,fmt.Errorf("error during download: %v", err)
         }
     }
 
@@ -349,25 +396,25 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
     }
 
     // 클라이언트에게 전체 파일 전송
-    response := &transport.Message{
-        Category:  transport.MessageCategory_RESPONSE,
-        Operation: transport.MessageOperation_DOWNLOAD,
-        Payload: &transport.ResponsePayload{
-            Download: &transport.DownloadFileResponse{
-                BaseResponse: transport.BaseResponse{
-                    Success: true,
-                    Message: "다운로드 성공",
-                },
-                FileContent: fullFileContent,
-            },
-        },
-    }
-    if err := stream.Send(response); err != nil {
-        return fmt.Errorf("failed to send file to client: %v", err)
-    }
+    // response := &transport.Message{
+    //     Category:  transport.MessageCategory_RESPONSE,
+    //     Operation: transport.MessageOperation_DOWNLOAD,
+    //     Payload: &transport.ResponsePayload{
+    //         Download: &transport.DownloadFileResponse{
+    //             BaseResponse: transport.BaseResponse{
+    //                 Success: true,
+    //                 Message: "다운로드 성공",
+    //             },
+    //             FileContent: fullFileContent,
+    //         },
+    //     },
+    // }
+    // if err := stream.Send(response); err != nil {
+    //     return nil,fmt.Errorf("failed to send file to client: %v", err)
+    // }
 
     log.Printf("MasterNode: Successfully downloaded and sent file %s for user %s", req.Filename, req.UserID)
-    return nil
+    return fullFileContent,nil
 }
 
 func (m *MasterNode) requestChunksFromDataNode(ctx context.Context, nodeID, addr, userID, filename string, chunksChan chan<- *transport.FileChunk) error {
@@ -613,16 +660,17 @@ func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequ
 	return nil, nil
 }
 
-func (m *MasterNode) Start(ctx context.Context,addr string) error {
-    transport, err := transport.NewMasterTCPTransport(addr, m)
-    if err != nil {
-        return fmt.Errorf("failed to set up TCP transport: %v", err)
-    }
-    m.transport = transport
-
+func (m *MasterNode) Start(ctx context.Context) error {
     errChan := make(chan error, 1)
     go func() {
-        errChan <- m.transport.Serve(ctx)
+        errChan <- m.tcpTransport.Serve(ctx)
+    }()
+
+    go func(){
+        if err := m.restServer.Serve(ctx); err !=nil{
+            log.Printf("REST server error: %v", err)
+            errChan <- err
+        }
     }()
 
     select {
@@ -637,15 +685,15 @@ func (m *MasterNode) Start(ctx context.Context,addr string) error {
 
 func (m *MasterNode) Stop() {
     close(m.stopChan)
-    if m.transport != nil {
-        m.transport.Close()
+    if m.tcpTransport != nil {
+        m.tcpTransport.Close()
     }
 }
 
 
-func RunMasterNode(ctx context.Context, id, addr string) error {
-    master := NewMasterNode(id)
-    return master.Start(ctx, addr)
+func RunMasterNode(ctx context.Context, id, tcpAddr,restAddr string) error {
+    master := NewMasterNode(id,tcpAddr,restAddr)
+    return master.Start(ctx)
 }
 
 func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {

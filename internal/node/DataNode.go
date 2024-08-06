@@ -20,7 +20,7 @@ import (
 type DataNode struct {
     ID         string
     store      *store.Store
-    masterConn net.Conn
+    // masterConn net.Conn
 	stopChan chan struct{}
 }
 
@@ -39,7 +39,7 @@ func (d *DataNode) Start(ctx context.Context,addr string, masterAddr string) err
     }
 
     // transport, err := transport.NewTCPTransport(addr, d)
-	transport, err := transport.NewDataTCPTransport(addr,d)
+	transport, err := transport.NewTCPTransport(addr,d)
     if err != nil {
         return fmt.Errorf("failed to set up TCP transport: %v", err)
     }
@@ -480,7 +480,7 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
     if err != nil {
         return err
     }
-    d.masterConn = conn
+    // d.masterConn = conn
 
     msg := &transport.Message{
 		Category: transport.MessageCategory_REQUEST,
