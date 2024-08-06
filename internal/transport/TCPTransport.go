@@ -1,109 +1,103 @@
 package transport
 
 import (
-	"encoding/binary"
-	"io"
+	"context"
+	"encoding/gob"
+	"log"
 	"net"
+	"strings"
+	"time"
 )
-
-
 
 type TCPTransport struct {
     listener net.Listener
-    handler  FileService
+    masterHandler MasterFileService
+    dataHandler DataFileService
+    stopChan chan struct{}
+    isMaster bool
 }
 
-func NewTCPTransport(address string, handler FileService) (*TCPTransport, error) {
+func NewMasterTCPTransport(address string, handler MasterFileService) (*TCPTransport, error) {
     listener, err := net.Listen("tcp", address)
     if err != nil {
         return nil, err
     }
     return &TCPTransport{
         listener: listener,
-        handler:  handler,
+        masterHandler: handler,
+        stopChan: make(chan struct{}),
+        isMaster: true,
     }, nil
 }
 
-func (t *TCPTransport) Serve() error {
-    for {
-        conn, err := t.listener.Accept()
-        if err != nil {
-            return err
-        }
-        go t.handleConnection(conn)
+func NewDataTCPTransport(address string, handler DataFileService) (*TCPTransport, error) {
+    listener, err := net.Listen("tcp", address)
+    if err != nil {
+        return nil, err
     }
+    return &TCPTransport{
+        listener: listener,
+        dataHandler: handler,
+        stopChan: make(chan struct{}),
+        isMaster: false,
+    }, nil
 }
 
-
-// Close Connection
-func (t *TCPTransport) Close() error{
-	
-	return nil
-}
-
-
-func (t *TCPTransport) handleConnection(conn net.Conn) {
-    defer conn.Close()
+func (t *TCPTransport) Serve(ctx context.Context) error {
     for {
-        // Read message type
-        var msgType uint32
-        if err := binary.Read(conn, binary.BigEndian, &msgType); err != nil {
-            return
-        }
-
-        // Handle different message types
-        switch msgType {
-        case 1: // UploadFile
-            t.handleUploadFile(conn)
-        case 2: // DownloadFile
-            t.handleDownloadFile(conn)
-        case 3: // DeleteFile
-            t.handleDeleteFile(conn)
-        case 4: // ListFiles
-            t.handleListFiles(conn)
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-t.stopChan:
+            return nil
         default:
-            return // Unknown message type
+            conn, err := t.listener.Accept()
+            if err != nil {
+                if ne, ok := err.(net.Error); ok && ne.Temporary() {
+                    time.Sleep(time.Second)
+                    continue
+                }
+                return err
+            }
+            if t.isMaster{
+                go t.masterHandler.TCPProtocl(ctx,conn);
+            }else{
+                go t.dataHandler.TCPProtocl(ctx,conn)
+            }
         }
     }
 }
 
-func (t *TCPTransport) handleUploadFile(conn net.Conn) {
-    // Implement upload file logic
-}
-
-func (t *TCPTransport) handleDownloadFile(conn net.Conn) {
-    // Implement download file logic
-}
-
-func (t *TCPTransport) handleDeleteFile(conn net.Conn) {
-    // Implement delete file logic
-}
-
-func (t *TCPTransport) handleListFiles(conn net.Conn) {
-    // Implement list files logic
+func (t *TCPTransport) Close() error {
+    close(t.stopChan)
+    return t.listener.Close()
 }
 
 
-// transport/transport.go
-
-type ChunkStream struct {
-    Chunks []FileChunk
-    CurrentIndex int
-}
-
-func (cs *ChunkStream) Recv() (*FileChunk, error) {
-    if cs.CurrentIndex >= len(cs.Chunks) {
-        return nil, io.EOF
+func SendMessage(conn net.Conn, msg *Message) error {
+    log.Printf("SendMessage : %v\n",msg)
+    encoder := gob.NewEncoder(conn)
+    err := encoder.Encode(msg)
+    if err != nil {
+        log.Printf("Error encoding message: %v", err)
+        if netErr, ok := err.(net.Error); ok {
+            log.Printf("Network error: timeout=%v, temporary=%v", netErr.Timeout(), netErr.Temporary())
+        }
     }
-    chunk := &cs.Chunks[cs.CurrentIndex]
-    cs.CurrentIndex++
-    return chunk, nil
+    return err
 }
 
-func (cs *ChunkStream) Send(*FileChunk) error {
-    return nil // 이 메서드는 사용되지 않지만 인터페이스 구현을 위해 필요합니다
-}
-
-func (cs *ChunkStream) CloseAndRecv() (*UploadFileResponse, error) {
-    return &UploadFileResponse{Success: true}, nil
+func ReceiveMessage(conn net.Conn) (*Message, error) {
+    decoder := gob.NewDecoder(conn)
+    msg := &Message{}
+    err := decoder.Decode(msg)
+    if err != nil {
+        if strings.Contains(err.Error(), "duplicate type received") {
+            // 중복 타입 에러 무시 또는 로깅
+            log.Printf("Warning: Duplicate type received, ignoring: %v", err)
+            return nil, nil
+        }
+        return nil, err
+    }
+    return msg, nil
 }

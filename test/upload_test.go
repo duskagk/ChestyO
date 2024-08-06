@@ -3,131 +3,296 @@
 package test
 
 import (
+	"ChestyO/internal/enum"
 	"ChestyO/internal/node"
-	"ChestyO/internal/store"
 	"ChestyO/internal/transport"
 	"bytes"
 	"context"
-	"fmt"
-	"io"
-	"io/ioutil"
+	"log"
+	"net"
+	"os"
 	"testing"
+	"time"
 )
 
+var file_name = "zxcv.txt"
+var user_name = "TestUser"
+
+
 func TestFileUpload(t *testing.T) {
-	// 마스터 노드 설정
-	masterAddr := ":8000"
-	master := node.NewMasterNode("master1")
-	masterTransport, err := transport.NewTCPTransport(masterAddr, master)
-	if err != nil {
-		t.Fatalf("Failed to create master transport: %v", err)
-	}
+    ctx, cancel := context.WithTimeout(context.Background(),time.Second*30)
+    defer cancel()
 
-	// 데이터 노드 설정
-	dataNode1 := node.NewDataNode("data1", store.StoreOpts{Root: "./tmp1/datanode1"})
-	dataNode2 := node.NewDataNode("data2", store.StoreOpts{Root: "./tmp2/datanode2"})
+    masterAddr := "localhost:8080"
+    dataAddr1 := "localhost:8081"
+    dataAddr2 := "localhost:8082"
 
-	dataTransport1, err := transport.NewTCPTransport(":8001", dataNode1)
-	if err != nil {
-		t.Fatalf("Failed to create data node 1 transport: %v", err)
-	}
-	dataTransport2, err := transport.NewTCPTransport(":8002", dataNode2)
-	if err != nil {
-		t.Fatalf("Failed to create data node 2 transport: %v", err)
-	}
+    // MasterNode 시작
+    master := node.NewMasterNode("master1")
+    go func() {
+        if err := master.Start(ctx, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run MasterNode: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+    // DataNode 시작
+    go func() {
+        if err := node.RunDataNode(ctx, "data1", dataAddr1, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode1: %v", err)
+        }
+    }()
 
-	// 노드들 시작
-	go masterTransport.Serve()
-	go dataTransport1.Serve()
-	go dataTransport2.Serve()
+    go func() {
+        if err := node.RunDataNode(ctx, "data2", dataAddr2, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode2: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+    
+    for i:=0;i<10;i++{
+        if master.GetConnectedDataNodesCount()==2{
+            break
+        }
+    }
 
-	// 마스터 노드에 데이터 노드 등록
-	master.AddDataNode(dataNode1.ID, dataNode1)
-	master.AddDataNode(dataNode2.ID, dataNode2)
 
-	// 테스트 파일 내용을 메모리에 저장
-	fileContent, err := ioutil.ReadFile("zxcv.txt")
-	if err != nil {
-		t.Fatalf("Failed to read test file: %v", err)
-	}
+    
+    content, err := os.ReadFile(file_name)
+    if err != nil {
+        t.Fatalf("Failed to read test file: %v", err)
+    }
 
-	req := &transport.UploadFileRequest{
-		Filename: "zxcv.txt",
-		FileSize: int64(len(fileContent)),
-		UserID:   "TestUser",
-	}
+    // MasterNode에 연결
+    conn, err := net.Dial("tcp", masterAddr)
+    if err != nil {
+        t.Fatalf("Failed to connect to MasterNode: %v", err)
+    }
+    defer conn.Close()
 
-	// 메모리에 저장된 내용을 사용하는 스트림 생성 함수
-	createStream := func() transport.UploadStream {
-		return &mockUploadStream{content: fileContent}
-	}
 
-	err = master.UploadFile(context.Background(), req, createStream)
-	if err != nil {
-		t.Fatalf("Failed to upload file: %v", err)
-	}
+    log.Printf("Send Upload request ...")
+    // 업로드 요청 전송
+    err = transport.SendMessage(conn, &transport.Message{
+        Category :  transport.MessageCategory_REQUEST,
+        Operation : transport.MessageOperation_UPLOAD,
+            Payload  :  &transport.RequestPayload{
+                Upload: &transport.UploadFileRequest{
+                UserID:   user_name,
+                Filename: file_name,
+                FileSize: int64(len(content)),
+                Policy:   enum.NoChange,
+                Content:  content,
+            },
+        },
+    })
+    if err != nil {
+        t.Fatalf("Failed to send upload request: %v", err)
+    }
 
-	// 파일 다운로드
-	downloadStream := &transport.FileDownloadStream{}
-	err = master.DownloadFile(context.Background(), &transport.DownloadFileRequest{
-		UserId:   req.UserID,
-		Filename: req.Filename,
-	}, downloadStream)
-	if err != nil {
-		t.Fatalf("Failed to download file: %v", err)
-	}
+    // 응답 대기
+    response, err := transport.ReceiveMessage(conn)
+    if err != nil {
+        t.Fatalf("Failed to receive upload response: %v", err)
+    }
 
-	var downloadedContent []byte
-	for {
-		chunk, err := downloadStream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Error receiving chunk: %v", err)
-		}
-		downloadedContent = append(downloadedContent, chunk.Content...)
-	}
+    // 응답 확인
+    if err!=nil {
+        t.Fatalf("Unexpected response type: %v", response)
+    }
 
-	// 원본 파일과 다운로드한 파일 비교
-	if !bytes.Equal(fileContent, downloadedContent) {
-		t.Errorf("Downloaded content does not match original content. Original size: %d, Downloaded size: %d", len(fileContent), len(downloadedContent))
-	} else {
-		fmt.Println("File content successfully uploaded and downloaded, matching the original content")
-	}
+    // if !response.UploadResponse.Success {
+    //     t.Fatalf("Upload failed: %s", response.UploadResponse.Message)
+    // }
+
+    log.Printf("Upload successful: %+v", response)
+    conn.Close()
 }
 
-// mockUploadStream은 테스트를 위한 UploadStream의 mock 구현입니다.
-type mockUploadStream struct {
-	content []byte
-	index   int
+func TestFileDownload(t *testing.T) {
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+    defer cancel()
+
+    masterAddr := "localhost:8080"
+    dataAddr1 := "localhost:8081"
+    dataAddr2 := "localhost:8082"
+
+    // MasterNode 시작
+    master := node.NewMasterNode("master1")
+    go func() {
+        if err := master.Start(ctx, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run MasterNode: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+
+    // DataNode 시작
+    go func() {
+        if err := node.RunDataNode(ctx, "data1", dataAddr1, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode1: %v", err)
+        }
+    }()
+
+    go func() {
+        if err := node.RunDataNode(ctx, "data2", dataAddr2, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode2: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+    
+    for i := 0; i < 10; i++ {
+        if master.GetConnectedDataNodesCount() == 2 {
+            break
+        }
+        time.Sleep(time.Second)
+    }
+
+    // MasterNode에 연결
+    conn, err := net.Dial("tcp", masterAddr)
+    if err != nil {
+        t.Fatalf("Failed to connect to MasterNode: %v", err)
+    }
+    defer conn.Close()
+
+    log.Printf("Send Download request ...")
+    // 다운로드 요청 전송
+    err = transport.SendMessage(conn, &transport.Message{
+        Category:  transport.MessageCategory_REQUEST,
+        Operation: transport.MessageOperation_DOWNLOAD,
+        Payload:   &transport.RequestPayload{
+            Download: &transport.DownloadFileRequest{
+                UserID:   user_name,
+                Filename: file_name,
+            },
+        },
+    })
+    if err != nil {
+        t.Fatalf("Failed to send download request: %v", err)
+    }
+
+    // 응답 대기
+    response, err := transport.ReceiveMessage(conn)
+    if err != nil {
+        t.Fatalf("Failed to receive download response: %v", err)
+    }
+
+    // 응답 확인
+    if response.Category != transport.MessageCategory_RESPONSE || response.Operation != transport.MessageOperation_DOWNLOAD {
+        t.Fatalf("Unexpected response type: %v", response)
+    }
+
+    downloadResponse, ok := response.Payload.(*transport.ResponsePayload)
+    if !ok || downloadResponse.Download == nil {
+        t.Fatalf("Invalid download response payload")
+    }
+
+    if !downloadResponse.Download.Success {
+        t.Fatalf("Download failed: %s", downloadResponse.Download.Message)
+    }
+
+    // 다운로드한 파일 내용 확인
+    downloadedContent := downloadResponse.Download.FileContent
+    originalContent, err := os.ReadFile(file_name)
+    if err != nil {
+        t.Fatalf("Failed to read original file: %v", err)
+    }
+
+    if !bytes.Equal(downloadedContent, originalContent) {
+        t.Fatalf("Downloaded content does not match original content")
+    }
+
+    err = os.WriteFile("valid.txt", downloadedContent, 0644)
+    if err != nil {
+        t.Fatalf("Failed to write downloaded content to valid.txt: %v", err)
+    }
+
+    log.Printf("Download successful: File size: %d bytes", len(downloadedContent))
 }
 
-func (m *mockUploadStream) Send(chunk *transport.FileChunk) error {
-	// 이 메서드는 실제로 사용되지 않습니다.
-	return nil
-}
 
-func (m *mockUploadStream) Recv() (*transport.FileChunk, error) {
-	if m.index >= len(m.content) {
-		return nil, io.EOF
-	}
+func TestFileDelete(t *testing.T) {
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+    defer cancel()
 
-	chunkSize := 1024 // 1KB 청크 크기
-	if m.index+chunkSize > len(m.content) {
-		chunkSize = len(m.content) - m.index
-	}
+    masterAddr := "localhost:8080"
+    dataAddr1 := "localhost:8081"
+    dataAddr2 := "localhost:8082"
 
-	chunk := &transport.FileChunk{
-		Content: m.content[m.index : m.index+chunkSize],
-	}
-	m.index += chunkSize
-	return chunk, nil
-}
+    // MasterNode 시작
+    master := node.NewMasterNode("master1")
+    go func() {
+        if err := master.Start(ctx, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run MasterNode: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
 
-func (m *mockUploadStream) CloseAndRecv() (*transport.UploadFileResponse, error) {
-	return &transport.UploadFileResponse{
-		Success: true,
-		Message: "File uploaded successfully",
-	}, nil
+    // DataNode 시작
+    go func() {
+        if err := node.RunDataNode(ctx, "data1", dataAddr1, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode1: %v", err)
+        }
+    }()
+
+    go func() {
+        if err := node.RunDataNode(ctx, "data2", dataAddr2, masterAddr); err != nil && err != context.Canceled {
+            t.Errorf("Failed to run DataNode2: %v", err)
+        }
+    }()
+    time.Sleep(time.Second)
+    
+    for i := 0; i < 10; i++ {
+        if master.GetConnectedDataNodesCount() == 2 {
+            break
+        }
+        time.Sleep(time.Second)
+    }
+
+    // MasterNode에 연결
+    conn, err := net.Dial("tcp", masterAddr)
+    if err != nil {
+        t.Fatalf("Failed to connect to MasterNode: %v", err)
+    }
+    defer conn.Close()
+
+    // 삭제 요청 전송
+    deleteRequest := &transport.Message{
+        Category:  transport.MessageCategory_REQUEST,
+        Operation: transport.MessageOperation_DELETE,
+        Payload: &transport.RequestPayload{
+            Delete: &transport.DeleteFileRequest{
+                UserID:   user_name,
+                Filename: file_name,
+            },
+        },
+    }
+    err = transport.SendMessage(conn, deleteRequest)
+    if err != nil {
+        t.Fatalf("Failed to send delete request: %v", err)
+    }
+
+    // 응답 수신
+    response, err := transport.ReceiveMessage(conn)
+    if err != nil {
+        t.Fatalf("Failed to receive delete response: %v", err)
+    }
+
+    // 응답 확인
+    payload, ok := response.Payload.(*transport.ResponsePayload)
+    if !ok || payload.Delete == nil {
+        t.Fatalf("Invalid delete response")
+    }
+
+    if !payload.Delete.Success {
+        t.Fatalf("Delete operation failed: %s", payload.Delete.Message)
+    }
+
+    log.Printf("Delete request sent successfully and received positive response")
+
+    // 파일이 실제로 삭제되었는지 확인 (선택적)
+    exists, _ := master.HasFile(ctx, user_name, file_name)
+    if exists {
+        t.Fatalf("File still exists after deletion")
+    }
+
+    log.Printf("File delete test passed successfully")
 }

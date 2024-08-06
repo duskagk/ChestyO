@@ -1,10 +1,9 @@
-package policy
+package enum
 
 type UploadPolicy int
 
 const (
-    Overwrite UploadPolicy = iota
-    VersionControl
-    Deduplication
-    IncrementalUpdate
+	Overwrite UploadPolicy = iota
+	VersionControl
+	NoChange
 )
