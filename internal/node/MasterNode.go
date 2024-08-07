@@ -8,7 +8,6 @@ import (
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
 	"context"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"log"
@@ -27,9 +26,8 @@ type DataNodeInfo struct {
 type MasterNode struct {
     ID            string
     dataNodes     map[string]*DataNodeInfo
-    fileLocations map[string][]string
     userMutexes   sync.Map
-    tcpTransport     *transport.TCPTransport
+    tcpTransport  *transport.TCPTransport
     mu            sync.RWMutex
     restServer      *rest.RestServer
     stopChan      chan struct{}
@@ -39,7 +37,6 @@ func NewMasterNode(id,tcpAddr, httpAddr string) *MasterNode {
     m := &MasterNode{
         ID:            id,
         dataNodes:     make(map[string]*DataNodeInfo),
-        fileLocations: make(map[string][]string),
         userMutexes:   sync.Map{},
         stopChan:      make(chan struct{}),
     }
@@ -62,21 +59,23 @@ func (m *MasterNode)TCPProtocl(ctx context.Context, conn net.Conn){
 }
 
 func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
-    defer conn.Close()
-    decoder := gob.NewDecoder(conn)
-
-    for {
+    // defer conn.Close()
+    // decoder := gob.NewDecoder(conn)
+    stream := transport.NewTCPStream(conn)
+    // for {
         select {
         case <-ctx.Done():
             log.Printf("Context cancelled, closing connection")
             return
         default:
-            var msg transport.Message
-            log.Printf("MasterNode Attempting to decode...")
-            decoder.Decode(&msg)
+            var msg *transport.Message
+            log.Printf("MasterNode Attempting to decode... %v",conn)
+            // decoder.Decode(&msg)
+            msg,_ = stream.Recv()
 
             log.Printf("Decoding Msg: %v", msg)
             go func() {
+
                 opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
                 defer cancel()
 
@@ -89,122 +88,136 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
                             if err != nil {
                                 log.Printf("Register error: %v", err)
                             }
-                        }
-                        return
-                    case transport.MessageOperation_UPLOAD:
-                        if ok {
-                            log.Printf("Upload Start : %v", payload)
-                            err := m.UploadFile(opCtx, payload.Upload)
-                            var response *transport.Message
-                            if err != nil {
-                                log.Printf("Upload error: %v", err)
-                                response = &transport.Message{
-                                    Category:  transport.MessageCategory_RESPONSE,
-                                    Operation: transport.MessageOperation_UPLOAD,
-                                    Payload: &transport.ResponsePayload{
-                                        Upload: &transport.UploadFileResponse{
-                                            BaseResponse: transport.BaseResponse{
-                                                Success: false,
-                                                Message: err.Error(),
-                                            },
-                                        },
-                                    },
-                                }
-                            }else{
-                                response = &transport.Message{
-                                    Category:  transport.MessageCategory_RESPONSE,
-                                    Operation: transport.MessageOperation_UPLOAD,
-                                    Payload: &transport.ResponsePayload{
-                                        Upload: &transport.UploadFileResponse{
-                                            BaseResponse: transport.BaseResponse{
-                                                Success: true,
-                                                Message: "File save success",
-                                            },
-                                        },
-                                    },
-                                }
-                            }
-                            transport.SendMessage(conn, response)
-                        }
-                        return
-                    case transport.MessageOperation_DOWNLOAD:
-                        if ok{
-                            file,err := m.DownloadFile(opCtx, payload.Download)
                             stream := transport.NewTCPStream(conn)
-                            var response *transport.Message 
-                            if err!=nil{
-                                response = &transport.Message{
-                                    Category:  transport.MessageCategory_RESPONSE,
-                                    Operation: transport.MessageOperation_DOWNLOAD,
-                                    Payload: &transport.ResponsePayload{
-                                        Download: &transport.DownloadFileResponse{
-                                            BaseResponse: transport.BaseResponse{
-                                                Success: false,
-                                                Message: err.Error(),
-                                            },
-                                            FileContent: file,
+                            resp := &transport.Message{
+                                Category: transport.MessageCategory_REQUEST,
+                                Operation:  transport.MessageOperation_REGISTER,
+                                Payload :  &transport.ResponsePayload{
+                                    Register: &transport.RegisterResponse{
+                                        BaseResponse: transport.BaseResponse{
+                                            Success: true,
+                                            Message: "Success Register",
                                         },
                                     },
-                                }
-                            }else{
-                                response = &transport.Message{
-                                    Category:  transport.MessageCategory_RESPONSE,
-                                    Operation: transport.MessageOperation_DOWNLOAD,
-                                    Payload: &transport.ResponsePayload{
-                                        Download: &transport.DownloadFileResponse{
-                                            BaseResponse: transport.BaseResponse{
-                                                Success: true,
-                                                Message: "다운로드 성공",
-                                            },
-                                            FileContent: file,
-                                        },
-                                    },
-                                }
+                                },
                             }
-                            stream.Send(response);
+                            log.Printf("Register success")
+                            stream.Send(resp)
                         }
-                        return
-                    case transport.MessageOperation_DELETE:
-                        if ok{
-                            err := m.DeleteFile(opCtx, payload.Delete)
-                            if err!=nil{
-                                response := &transport.Message{
-                                    Category:  transport.MessageCategory_RESPONSE,
-                                    Operation: transport.MessageOperation_DELETE,
-                                    Payload: &transport.ResponsePayload{
-                                        Delete: &transport.DeleteFileResponse{
-                                            BaseResponse: transport.BaseResponse{
-                                                Success: false,
-                                                Message: err.Error(),
-                                            },
-                                        },
-                                    },
-                                }
-                                transport.SendMessage(conn, response)
-                            }else{
-                                response := &transport.Message{
-                                    Category:  transport.MessageCategory_RESPONSE,
-                                    Operation: transport.MessageOperation_DELETE,
-                                    Payload: &transport.ResponsePayload{
-                                        Delete: &transport.DeleteFileResponse{
-                                            BaseResponse: transport.BaseResponse{
-                                                Success: true,
-                                                Message: "Success Delete File",
-                                            },
-                                        },
-                                    },
-                                }
-                                transport.SendMessage(conn, response)
-                            }
-                            return
-                        }
+                    // case transport.MessageOperation_UPLOAD:
+                    //     if ok {
+                    //         log.Printf("Upload Start : %v", payload)
+                    //         err := m.UploadFile(opCtx, payload.Upload)
+                    //         var response *transport.Message
+                    //         if err != nil {
+                    //             log.Printf("Upload error: %v", err)
+                    //             response = &transport.Message{
+                    //                 Category:  transport.MessageCategory_RESPONSE,
+                    //                 Operation: transport.MessageOperation_UPLOAD,
+                    //                 Payload: &transport.ResponsePayload{
+                    //                     Upload: &transport.UploadFileResponse{
+                    //                         BaseResponse: transport.BaseResponse{
+                    //                             Success: false,
+                    //                             Message: err.Error(),
+                    //                         },
+                    //                     },
+                    //                 },
+                    //             }
+                    //         }else{
+                    //             response = &transport.Message{
+                    //                 Category:  transport.MessageCategory_RESPONSE,
+                    //                 Operation: transport.MessageOperation_UPLOAD,
+                    //                 Payload: &transport.ResponsePayload{
+                    //                     Upload: &transport.UploadFileResponse{
+                    //                         BaseResponse: transport.BaseResponse{
+                    //                             Success: true,
+                    //                             Message: "File save success",
+                    //                         },
+                    //                     },
+                    //                 },
+                    //             }
+                    //         }
+                    //         transport.SendMessage(conn, response)
+                    //     }
+                    //     return
+                    // case transport.MessageOperation_DOWNLOAD:
+                    //     if ok{
+                    //         file,err := m.DownloadFile(opCtx, payload.Download)
+                    //         stream := transport.NewTCPStream(conn)
+                    //         var response *transport.Message 
+                    //         if err!=nil{
+                    //             response = &transport.Message{
+                    //                 Category:  transport.MessageCategory_RESPONSE,
+                    //                 Operation: transport.MessageOperation_DOWNLOAD,
+                    //                 Payload: &transport.ResponsePayload{
+                    //                     Download: &transport.DownloadFileResponse{
+                    //                         BaseResponse: transport.BaseResponse{
+                    //                             Success: false,
+                    //                             Message: err.Error(),
+                    //                         },
+                    //                         FileContent: file,
+                    //                     },
+                    //                 },
+                    //             }
+                    //         }else{
+                    //             response = &transport.Message{
+                    //                 Category:  transport.MessageCategory_RESPONSE,
+                    //                 Operation: transport.MessageOperation_DOWNLOAD,
+                    //                 Payload: &transport.ResponsePayload{
+                    //                     Download: &transport.DownloadFileResponse{
+                    //                         BaseResponse: transport.BaseResponse{
+                    //                             Success: true,
+                    //                             Message: "다운로드 성공",
+                    //                         },
+                    //                         FileContent: file,
+                    //                     },
+                    //                 },
+                    //             }
+                    //         }
+                    //         stream.Send(response);
+                    //     }
+                    //     return
+                    // case transport.MessageOperation_DELETE:
+                    //     if ok{
+                    //         err := m.DeleteFile(opCtx, payload.Delete)
+                    //         if err!=nil{
+                    //             response := &transport.Message{
+                    //                 Category:  transport.MessageCategory_RESPONSE,
+                    //                 Operation: transport.MessageOperation_DELETE,
+                    //                 Payload: &transport.ResponsePayload{
+                    //                     Delete: &transport.DeleteFileResponse{
+                    //                         BaseResponse: transport.BaseResponse{
+                    //                             Success: false,
+                    //                             Message: err.Error(),
+                    //                         },
+                    //                     },
+                    //                 },
+                    //             }
+                    //             transport.SendMessage(conn, response)
+                    //         }else{
+                    //             response := &transport.Message{
+                    //                 Category:  transport.MessageCategory_RESPONSE,
+                    //                 Operation: transport.MessageOperation_DELETE,
+                    //                 Payload: &transport.ResponsePayload{
+                    //                     Delete: &transport.DeleteFileResponse{
+                    //                         BaseResponse: transport.BaseResponse{
+                    //                             Success: true,
+                    //                             Message: "Success Delete File",
+                    //                         },
+                    //                     },
+                    //                 },
+                    //             }
+                    //             transport.SendMessage(conn, response)
+                    //         }
+                    //         return
+                    //     }
                     default:
                     }
                 }
 
             }()
         }
-    }
+    // }
 }
 
 
@@ -702,15 +715,14 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
     m.mu.Lock()
     defer m.mu.Unlock()
 
-    _, err := net.Dial("tcp", req.Addr)
-    if err != nil {
-        return fmt.Errorf("failed to connect to DataNode %s: %v", req.NodeID, err)
-    }
+    // _, err := net.Dial("tcp", req.Addr)
+    // if err != nil {
+    //     return fmt.Errorf("failed to connect to DataNode %s: %v", req.NodeID, err)
+    // }
 
     m.dataNodes[req.NodeID] = &DataNodeInfo{
         ID:   req.NodeID,
         Addr: req.Addr,
-        // Conn: conn,
     }
 
     log.Printf("Registered DataNode: %s at %s", req.NodeID, req.Addr)

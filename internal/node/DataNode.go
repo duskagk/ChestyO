@@ -480,7 +480,8 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
     if err != nil {
         return err
     }
-    // d.masterConn = conn
+
+    stream := transport.NewTCPStream(conn)
 
     msg := &transport.Message{
 		Category: transport.MessageCategory_REQUEST,
@@ -492,10 +493,16 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
 			},
 		},
     }
-    return transport.SendMessage(conn, msg)
-}
+    stream.Send(msg)
+    _, err =stream.CloseAndRecv()
+    if err!=nil{
+        log.Printf("Connection error : %v",err)
+        return err
+    }
+    
+    
+    // stream.CloseStream()
 
-func (m *DataNode) Register(ctx context.Context,req *transport.RegisterMessage) error {
     return nil
 }
 

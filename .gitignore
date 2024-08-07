@@ -28,6 +28,8 @@ go.work
 /test/tmp*/
 /test/*.txt
 
+/tmp
+
 # Log files
 *.log
 

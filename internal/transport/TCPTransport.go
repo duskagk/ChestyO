@@ -43,12 +43,7 @@ func (t *TCPTransport) Serve(ctx context.Context) error {
                 }
                 return err
             }
-
             go t.handler.TCPProtocl(ctx,conn)
-
-            // go t.masterHandler.TCPProtocl(ctx,conn);
-            // go t.dataHandler.TCPProtocl(ctx,conn)
-
         }
     }
 }

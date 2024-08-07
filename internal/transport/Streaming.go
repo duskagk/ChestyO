@@ -51,3 +51,7 @@ func (s *StreamService) CloseAndRecv() (*Message, error) {
     s.conn.Close()
     return &msg, nil
 }
+
+func (s *StreamService) CloseStream() {
+    s.conn.Close()
+}

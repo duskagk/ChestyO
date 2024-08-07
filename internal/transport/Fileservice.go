@@ -30,5 +30,6 @@ type TCPStream interface {
     Send(*Message) error
 	SendAndClose(*Message) error
     CloseAndRecv() (*Message, error)
+    CloseStream()
 }
 
