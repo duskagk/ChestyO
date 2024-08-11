@@ -26,19 +26,21 @@ type DataNodeInfo struct {
 type MasterNode struct {
     ID            string
     dataNodes     map[string]*DataNodeInfo
-    userMutexes   sync.Map
     tcpTransport  *transport.TCPTransport
     mu            sync.RWMutex
     restServer      *rest.RestServer
     stopChan      chan struct{}
+
+    metadata map[string]*UserMetadata
+    metadataMu sync.RWMutex
 }
 
 func NewMasterNode(id,tcpAddr, httpAddr string) *MasterNode {
     m := &MasterNode{
         ID:            id,
         dataNodes:     make(map[string]*DataNodeInfo),
-        userMutexes:   sync.Map{},
         stopChan:      make(chan struct{}),
+        metadata: make(map[string]*UserMetadata),
     }
     
     transport, err := transport.NewTCPTransport(tcpAddr, m)
@@ -775,3 +777,96 @@ func (m *MasterNode) GetConnectedDataNodesCount() int {
 
 
 
+func (m *MasterNode) AddMetadata(userID, filename string, meta FileMetadata) {
+    m.metadataMu.RLock()
+    userMeta, exists := m.metadata[userID]
+    if !exists {
+        m.metadataMu.RUnlock()
+        m.metadataMu.Lock()
+        userMeta, exists = m.metadata[userID]
+        if !exists {
+            userMeta = &UserMetadata{files: make(map[string]FileMetadata)}
+            m.metadata[userID] = userMeta
+        }
+        m.metadataMu.Unlock()
+    } else {
+        m.metadataMu.RUnlock()
+    }
+
+    userMeta.mu.Lock()
+    userMeta.files[filename] = meta
+    userMeta.mu.Unlock()
+}
+
+func (m *MasterNode) GetMetadata(userID, filename string) (FileMetadata, bool) {
+    m.metadataMu.RLock()
+    userMeta, exists := m.metadata[userID]
+    m.metadataMu.RUnlock()
+
+    if !exists {
+        return FileMetadata{}, false
+    }
+
+    userMeta.mu.RLock()
+    meta, exists := userMeta.files[filename]
+    userMeta.mu.RUnlock()
+
+    return meta, exists
+}
+
+func (m *MasterNode) UpdateMetadata(userID, filename string, meta FileMetadata) bool {
+    m.metadataMu.RLock()
+    userMeta, exists := m.metadata[userID]
+    m.metadataMu.RUnlock()
+
+    if !exists {
+        return false
+    }
+
+    userMeta.mu.Lock()
+    _, exists = userMeta.files[filename]
+    if exists {
+        userMeta.files[filename] = meta
+    }
+    userMeta.mu.Unlock()
+
+    return exists
+}
+
+func (m *MasterNode) DeleteMetadata(userID, filename string) bool {
+    m.metadataMu.RLock()
+    userMeta, exists := m.metadata[userID]
+    m.metadataMu.RUnlock()
+
+    if !exists {
+        return false
+    }
+
+    userMeta.mu.Lock()
+    _, exists = userMeta.files[filename]
+    if exists {
+        delete(userMeta.files, filename)
+    }
+    userMeta.mu.Unlock()
+
+    return exists
+}
+
+func (m *MasterNode) ListMetadata(userID string) []FileMetadata {
+    m.metadataMu.RLock()
+    userMeta, exists := m.metadata[userID]
+    m.metadataMu.RUnlock()
+
+    if !exists {
+        return nil
+    }
+
+    userMeta.mu.RLock()
+    result := make([]FileMetadata, 0, len(userMeta.files))
+    for _, meta := range userMeta.files {
+        result = append(result, meta)
+    }
+    userMeta.mu.RUnlock()
+
+    return result
+}
