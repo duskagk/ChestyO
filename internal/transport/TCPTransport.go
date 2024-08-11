@@ -11,35 +11,19 @@ import (
 
 type TCPTransport struct {
     listener net.Listener
-    masterHandler MasterFileService
-    dataHandler DataFileService
+    handler  FileService
     stopChan chan struct{}
-    isMaster bool
 }
 
-func NewMasterTCPTransport(address string, handler MasterFileService) (*TCPTransport, error) {
+func NewTCPTransport(address string, handler FileService) (*TCPTransport, error) {
     listener, err := net.Listen("tcp", address)
     if err != nil {
         return nil, err
     }
     return &TCPTransport{
         listener: listener,
-        masterHandler: handler,
+        handler:  handler,
         stopChan: make(chan struct{}),
-        isMaster: true,
-    }, nil
-}
-
-func NewDataTCPTransport(address string, handler DataFileService) (*TCPTransport, error) {
-    listener, err := net.Listen("tcp", address)
-    if err != nil {
-        return nil, err
-    }
-    return &TCPTransport{
-        listener: listener,
-        dataHandler: handler,
-        stopChan: make(chan struct{}),
-        isMaster: false,
     }, nil
 }
 
@@ -59,11 +43,7 @@ func (t *TCPTransport) Serve(ctx context.Context) error {
                 }
                 return err
             }
-            if t.isMaster{
-                go t.masterHandler.TCPProtocl(ctx,conn);
-            }else{
-                go t.dataHandler.TCPProtocl(ctx,conn)
-            }
+            go t.handler.TCPProtocl(ctx,conn)
         }
     }
 }
