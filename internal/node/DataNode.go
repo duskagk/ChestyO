@@ -2,6 +2,7 @@ package node
 
 // internal/node/DataNode.go
 import (
+	"ChestyO/internal/kvserver"
 	"ChestyO/internal/store"
 	"ChestyO/internal/transport"
 	"bytes"
@@ -22,13 +23,18 @@ type DataNode struct {
     store      *store.Store
     // masterConn net.Conn
 	stopChan chan struct{}
+    kvstore       *kvserver.KVStore
 }
 
-func NewDataNode(id string, storeOpts store.StoreOpts) *DataNode {
+func NewDataNode(id string, storeOpts store.StoreOpts,numbuckets int) *DataNode {
+
+    kv_store := kvserver.NewKVStore(id,numbuckets)
+
 	return &DataNode{
 		ID:    id,
 		store: store.NewStore(storeOpts),
 		stopChan: make(chan struct{}),
+        kvstore: kv_store,
 	}
 }
 
@@ -326,10 +332,10 @@ func (d *DataNode) HasFile(ctx context.Context,userId, filename string) bool {
 	return d.store.Has(userId, filename)
 }
 
-func RunDataNode(ctx context.Context,id, addr, masterAddr string) error {
-    dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("./tmp/datanode_%s", id)})
-    return dataNode.Start(ctx,addr, masterAddr)
-}
+// func RunDataNode(ctx context.Context,id, addr, masterAddr string) error {
+//     dataNode := NewDataNode(id, store.StoreOpts{Root: fmt.Sprintf("./tmp/datanode_%s", id)})
+//     return dataNode.Start(ctx,addr, masterAddr)
+// }
 
 
 // DeleteFile deletes a file from the distributed system
@@ -483,6 +489,7 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
 
     stream := transport.NewTCPStream(conn)
 
+    
     msg := &transport.Message{
 		Category: transport.MessageCategory_REQUEST,
 		Operation:  transport.MessageOperation_REGISTER,
@@ -490,6 +497,7 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
 			Register: &transport.RegisterMessage{
 				NodeID: d.ID,
 				Addr: addr,
+                BucketNum: d.kvstore.Len(),
 			},
 		},
     }
@@ -499,10 +507,6 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
         log.Printf("Connection error : %v",err)
         return err
     }
-    
-    
-    // stream.CloseStream()
-
     return nil
 }
 

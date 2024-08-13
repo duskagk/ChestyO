@@ -1,7 +1,6 @@
-package node
+package kvserver
 
 import (
-	"sync"
 	"time"
 )
 
@@ -12,6 +11,5 @@ type FileMetadata struct {
 }
 
 type UserMetadata struct {
-    files map[string]FileMetadata
-    mu    sync.RWMutex
+    Files map[string]FileMetadata
 }

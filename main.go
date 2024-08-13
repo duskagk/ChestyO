@@ -2,8 +2,10 @@ package main
 
 import (
 	"ChestyO/internal/node"
+	"ChestyO/internal/store"
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -16,6 +18,7 @@ func main() {
     tcpAddr := flag.String("tcp", "", "TCP address to listen on")
     httpAddr := flag.String("http", "", "HTTP address to listen on (for master node)")
     masterAddr := flag.String("master", "", "Address of the master node (for data nodes)")
+    numBuckets := flag.Int("buckets", 4, "Number of buckets for KVStore (default: 4)")
     flag.Parse()
 
     ctx, cancel := context.WithCancel(context.Background())
@@ -35,13 +38,16 @@ func main() {
         if *httpAddr == "" {
             log.Fatal("HTTP address is required for master node")
         }
-        masterNode := node.NewMasterNode(*nodeID, *tcpAddr, *httpAddr)
+        masterNode := node.NewMasterNode(*nodeID, *tcpAddr, *httpAddr,*numBuckets)
         err = masterNode.Start(ctx)
     case "data":
         if *masterAddr == "" {
             log.Fatal("Master address is required for data node")
         }
-        err = node.RunDataNode(ctx, *nodeID, *tcpAddr, *masterAddr)
+        // err = node.RunDataNode(ctx, *nodeID, *tcpAddr, *masterAddr)
+        
+        dataNode := node.NewDataNode(*nodeID, store.StoreOpts{Root: fmt.Sprintf("./nfs/%s", *nodeID)}, *numBuckets)
+        dataNode.Start(ctx,*tcpAddr, *masterAddr)
     default:
         log.Fatal("Invalid node type. Use 'master' or 'data'")
     }

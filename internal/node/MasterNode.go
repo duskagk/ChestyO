@@ -4,6 +4,7 @@ package node
 
 import (
 	policy "ChestyO/internal/enum"
+	"ChestyO/internal/kvserver"
 	"ChestyO/internal/rest"
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
@@ -18,29 +19,26 @@ import (
 )
 
 type DataNodeInfo struct {
-    ID      string
-    Addr    string
-    // Conn    net.Conn
+    ID              string
+    Addr            string
+    BucketNum       int
 }
 
 type MasterNode struct {
-    ID            string
-    dataNodes     map[string]*DataNodeInfo
-    tcpTransport  *transport.TCPTransport
-    mu            sync.RWMutex
+    ID              string
+    dataNodes       map[string]*DataNodeInfo
+    tcpTransport    *transport.TCPTransport
     restServer      *rest.RestServer
-    stopChan      chan struct{}
-
-    metadata map[string]*UserMetadata
-    metadataMu sync.RWMutex
+    stopChan        chan struct{}
+    kvstore         *kvserver.KVStore
+    consistentHash  *ConsistentHash
 }
 
-func NewMasterNode(id,tcpAddr, httpAddr string) *MasterNode {
+func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
     m := &MasterNode{
-        ID:            id,
-        dataNodes:     make(map[string]*DataNodeInfo),
-        stopChan:      make(chan struct{}),
-        metadata: make(map[string]*UserMetadata),
+        ID:             id,
+        dataNodes:      make(map[string]*DataNodeInfo),
+        stopChan:       make(chan struct{}),
     }
     
     transport, err := transport.NewTCPTransport(tcpAddr, m)
@@ -52,6 +50,8 @@ func NewMasterNode(id,tcpAddr, httpAddr string) *MasterNode {
     // RestServer 생성
     m.restServer = rest.NewServer(m, httpAddr)
 
+    m.kvstore = kvserver.NewKVStore(id,bucknum)
+    m.consistentHash = NewConsistentHash(1);
     return m
 }
 
@@ -410,24 +410,6 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
         fullFileContent = append(fullFileContent, chunks[int(index)]...)
     }
 
-    // 클라이언트에게 전체 파일 전송
-    // response := &transport.Message{
-    //     Category:  transport.MessageCategory_RESPONSE,
-    //     Operation: transport.MessageOperation_DOWNLOAD,
-    //     Payload: &transport.ResponsePayload{
-    //         Download: &transport.DownloadFileResponse{
-    //             BaseResponse: transport.BaseResponse{
-    //                 Success: true,
-    //                 Message: "다운로드 성공",
-    //             },
-    //             FileContent: fullFileContent,
-    //         },
-    //     },
-    // }
-    // if err := stream.Send(response); err != nil {
-    //     return nil,fmt.Errorf("failed to send file to client: %v", err)
-    // }
-
     log.Printf("MasterNode: Successfully downloaded and sent file %s for user %s", req.Filename, req.UserID)
     return fullFileContent,nil
 }
@@ -706,26 +688,16 @@ func (m *MasterNode) Stop() {
 }
 
 
-func RunMasterNode(ctx context.Context, id, tcpAddr,restAddr string) error {
-    master := NewMasterNode(id,tcpAddr,restAddr)
-    return master.Start(ctx)
-}
-
 func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
     log.Printf("MasterNode: Received registration request from %v\n", req)
-
-    m.mu.Lock()
-    defer m.mu.Unlock()
-
-    // _, err := net.Dial("tcp", req.Addr)
-    // if err != nil {
-    //     return fmt.Errorf("failed to connect to DataNode %s: %v", req.NodeID, err)
-    // }
-
-    m.dataNodes[req.NodeID] = &DataNodeInfo{
+    nodeInfo := &DataNodeInfo{
         ID:   req.NodeID,
         Addr: req.Addr,
+        BucketNum: req.BucketNum,
     }
+
+    m.dataNodes[req.NodeID] = nodeInfo
+    m.consistentHash.AddNode(nodeInfo)
 
     log.Printf("Registered DataNode: %s at %s", req.NodeID, req.Addr)
     return nil
@@ -737,9 +709,6 @@ func (m *MasterNode) Register(ctx context.Context, req *transport.RegisterMessag
 }
 
 func (m *MasterNode) distributeChunks(chunks []*transport.FileChunk) map[string][]*transport.FileChunk {
-    m.mu.RLock()
-    defer m.mu.RUnlock()
-
     distribution := make(map[string][]*transport.FileChunk)
     nodeIDs := make([]string, 0, len(m.dataNodes))
     
@@ -769,104 +738,8 @@ func (m *MasterNode) distributeChunks(chunks []*transport.FileChunk) map[string]
 
 
 func (m *MasterNode) GetConnectedDataNodesCount() int {
-    m.mu.RLock()
-    defer m.mu.RUnlock()
     return len(m.dataNodes)
 }
 
 
 
-
-func (m *MasterNode) AddMetadata(userID, filename string, meta FileMetadata) {
-    m.metadataMu.RLock()
-    userMeta, exists := m.metadata[userID]
-    if !exists {
-        m.metadataMu.RUnlock()
-        m.metadataMu.Lock()
-        userMeta, exists = m.metadata[userID]
-        if !exists {
-            userMeta = &UserMetadata{files: make(map[string]FileMetadata)}
-            m.metadata[userID] = userMeta
-        }
-        m.metadataMu.Unlock()
-    } else {
-        m.metadataMu.RUnlock()
-    }
-
-    userMeta.mu.Lock()
-    userMeta.files[filename] = meta
-    userMeta.mu.Unlock()
-}
-
-func (m *MasterNode) GetMetadata(userID, filename string) (FileMetadata, bool) {
-    m.metadataMu.RLock()
-    userMeta, exists := m.metadata[userID]
-    m.metadataMu.RUnlock()
-
-    if !exists {
-        return FileMetadata{}, false
-    }
-
-    userMeta.mu.RLock()
-    meta, exists := userMeta.files[filename]
-    userMeta.mu.RUnlock()
-
-    return meta, exists
-}
-
-func (m *MasterNode) UpdateMetadata(userID, filename string, meta FileMetadata) bool {
-    m.metadataMu.RLock()
-    userMeta, exists := m.metadata[userID]
-    m.metadataMu.RUnlock()
-
-    if !exists {
-        return false
-    }
-
-    userMeta.mu.Lock()
-    _, exists = userMeta.files[filename]
-    if exists {
-        userMeta.files[filename] = meta
-    }
-    userMeta.mu.Unlock()
-
-    return exists
-}
-
-func (m *MasterNode) DeleteMetadata(userID, filename string) bool {
-    m.metadataMu.RLock()
-    userMeta, exists := m.metadata[userID]
-    m.metadataMu.RUnlock()
-
-    if !exists {
-        return false
-    }
-
-    userMeta.mu.Lock()
-    _, exists = userMeta.files[filename]
-    if exists {
-        delete(userMeta.files, filename)
-    }
-    userMeta.mu.Unlock()
-
-    return exists
-}
-
-func (m *MasterNode) ListMetadata(userID string) []FileMetadata {
-    m.metadataMu.RLock()
-    userMeta, exists := m.metadata[userID]
-    m.metadataMu.RUnlock()
-
-    if !exists {
-        return nil
-    }
-
-    userMeta.mu.RLock()
-    result := make([]FileMetadata, 0, len(userMeta.files))
-    for _, meta := range userMeta.files {
-        result = append(result, meta)
-    }
-    userMeta.mu.RUnlock()
-
-    return result
-}

@@ -139,8 +139,9 @@ type FileMetadata struct {
 }
 
 type RegisterMessage struct{
-	NodeID string
-    Addr   string
+	NodeID      string
+    Addr        string
+    BucketNum   int
 }
 
 type HasFileRequest struct {
