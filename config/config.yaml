@@ -1,0 +1,4 @@
+kvserver:
+  server:
+    host: "localhost"
+    port: 6195

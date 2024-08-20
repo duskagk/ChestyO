@@ -2,7 +2,6 @@ package node
 
 // internal/node/DataNode.go
 import (
-	"ChestyO/internal/kvserver"
 	"ChestyO/internal/store"
 	"ChestyO/internal/transport"
 	"bytes"
@@ -23,18 +22,14 @@ type DataNode struct {
     store      *store.Store
     // masterConn net.Conn
 	stopChan chan struct{}
-    kvstore       *kvserver.KVStore
 }
 
 func NewDataNode(id string, storeOpts store.StoreOpts,numbuckets int) *DataNode {
-
-    kv_store := kvserver.NewKVStore(id,numbuckets)
 
 	return &DataNode{
 		ID:    id,
 		store: store.NewStore(storeOpts),
 		stopChan: make(chan struct{}),
-        kvstore: kv_store,
 	}
 }
 
@@ -497,7 +492,6 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
 			Register: &transport.RegisterMessage{
 				NodeID: d.ID,
 				Addr: addr,
-                BucketNum: d.kvstore.Len(),
 			},
 		},
     }

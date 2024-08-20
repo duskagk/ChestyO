@@ -3,12 +3,14 @@ package node
 // internal/node/MasterNode.go
 
 import (
+	"ChestyO/internal/config"
 	policy "ChestyO/internal/enum"
-	"ChestyO/internal/kvserver"
+	"ChestyO/internal/kvclient"
 	"ChestyO/internal/rest"
 	"ChestyO/internal/transport"
 	"ChestyO/internal/utils"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +23,6 @@ import (
 type DataNodeInfo struct {
     ID              string
     Addr            string
-    BucketNum       int
 }
 
 type MasterNode struct {
@@ -30,8 +31,7 @@ type MasterNode struct {
     tcpTransport    *transport.TCPTransport
     restServer      *rest.RestServer
     stopChan        chan struct{}
-    kvstore         *kvserver.KVStore
-    consistentHash  *ConsistentHash
+    kvClient        *kvclient.KVClient
 }
 
 func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
@@ -50,8 +50,14 @@ func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
     // RestServer 생성
     m.restServer = rest.NewServer(m, httpAddr)
 
-    m.kvstore = kvserver.NewKVStore(id,bucknum)
-    m.consistentHash = NewConsistentHash(1);
+    cfg, err := config.LoadConfig("config.yaml")
+
+    if err !=nil{
+        return nil
+    }
+
+    m.kvClient = kvclient.NewKVClient(cfg.KVServer.Server.Host,cfg.KVServer.Server.Port)
+
     return m
 }
 
@@ -352,6 +358,20 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
 
+
+    metadata := kvclient.FileMetadata{
+        RetentionTime: time.Now().AddDate(0, 0, 90),  // 지금으로부터 90일 뒤
+        FileSize:      int64(len(req.Content)),
+        ChunkNodes:    []string{"node1"},
+    }
+    key := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
+    metadataJSON, err := json.Marshal(metadata)
+
+    if err !=nil{
+        return err
+    }
+    // 현재 시간
+    m.kvClient.Set(key, string(metadataJSON))
 
     return nil
 }
@@ -693,11 +713,10 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
     nodeInfo := &DataNodeInfo{
         ID:   req.NodeID,
         Addr: req.Addr,
-        BucketNum: req.BucketNum,
     }
 
     m.dataNodes[req.NodeID] = nodeInfo
-    m.consistentHash.AddNode(nodeInfo)
+
 
     log.Printf("Registered DataNode: %s at %s", req.NodeID, req.Addr)
     return nil
