@@ -51,7 +51,7 @@ func (s *RestServer) Serve(ctx context.Context) error {
     mux := http.NewServeMux()
     
     // 라우트 설정
-	mux.HandleFunc("/upload", ipFilterMiddleware(s.handler.HandleUpload))
+	mux.HandleFunc("/upload", s.handler.HandleUpload)
 	mux.HandleFunc("/download", ipFilterMiddleware(s.handler.HandleDownload))
 	mux.HandleFunc("/delete", ipFilterMiddleware(s.handler.HandleDelete))
 	mux.HandleFunc("/sharetoken", ipFilterMiddleware(s.handler.HandleShareToken))

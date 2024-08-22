@@ -16,7 +16,7 @@ type MasterFileService interface{
     UploadFile(ctx context.Context, req *UploadFileRequest) error
     DeleteFile(ctx context.Context, req *DeleteFileRequest) error
     // ListFiles(ctx context.Context, req *ListFilesRequest) (*ListFilesResponse, error)
-    HasFile(ctx context.Context, userID, filename string) (bool, map[string]bool)
+    // HasFile(ctx context.Context, userID, filename string) (bool, map[string]bool)
     DownloadFile(ctx context.Context, req *DownloadFileRequest) ([]byte,error)
 }
 

@@ -5,9 +5,9 @@ import (
 )
 
 type FileMetadata struct {
-    RetentionTime time.Time
-    FileSize      int64
-    ChunkNodes    []string
+    RetentionTime time.Time `json:"retentionTime"`
+    FileSize      int64     `json:"fileSize"`
+    ChunkNodes    []string  `json:"chunkNodes"`
 }
 
 type UserMetadata struct {

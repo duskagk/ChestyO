@@ -479,6 +479,7 @@ func (d *DataNode) ReadChunk(userId, filename, chunkName string) ([]byte, error)
 func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
     conn, err := net.Dial("tcp", masterAddr)
     if err != nil {
+        log.Printf("Dial fail %v",err)
         return err
     }
 

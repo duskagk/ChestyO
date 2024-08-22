@@ -20,6 +20,7 @@ import (
 	"time"
 )
 
+
 type DataNodeInfo struct {
     ID              string
     Addr            string
@@ -32,6 +33,9 @@ type MasterNode struct {
     restServer      *rest.RestServer
     stopChan        chan struct{}
     kvClient        *kvclient.KVClient
+    nodeMu          sync.Mutex
+    nodeKeys     []string                 // 맵의 키를 저장할 리스트
+	currentIndex int                      // 현재 라운드 로빈 인덱스
 }
 
 func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
@@ -53,6 +57,7 @@ func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
     cfg, err := config.LoadConfig("config.yaml")
 
     if err !=nil{
+        log.Fatal("Failed to load config.yaml")
         return nil
     }
 
@@ -229,80 +234,36 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 
-func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, map[string]bool) {
-    responses := make(map[string]bool)
-    var mu sync.Mutex
-    var wg sync.WaitGroup
+func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, *kvclient.FileMetadata, error) {
+    key := fmt.Sprintf("file:%s:%s", userID, filename)
+    metadataJSON, err := m.kvClient.Get(key)
 
-    for nodeID, node := range m.dataNodes {
-        wg.Add(1)
-        go func(nodeID, addr string) {
-            defer wg.Done()
-            hasFile, err := m.checkFileInDataNode( addr, userID, filename)
-            if err != nil {
-                log.Printf("Error checking file in node %s: %v", nodeID, err)
-                return
-            }
-            mu.Lock()
-            responses[nodeID] = hasFile
-            mu.Unlock()
-        }(nodeID, node.Addr)
+    if err != nil {
+        return false, nil, fmt.Errorf("failed to get file metadata: %v", err)
     }
 
-    wg.Wait()
-
-    hasFile := false
-    for _, exists := range responses {
-        if exists {
-            hasFile = true
-            break
-        }
+    if metadataJSON == "" {
+        return false, nil, nil
     }
 
-    return hasFile, responses
+    var metadata kvclient.FileMetadata
+    err = json.Unmarshal([]byte(metadataJSON), &metadata)
+    if err != nil {
+        return false, nil, fmt.Errorf("failed to unmarshal file metadata: %v", err)
+    }
+
+    return true, &metadata, nil
 }
 
-func (m *MasterNode) checkFileInDataNode(addr, user_id, filename string) (bool, error) {
-    log.Printf("MasterNode: check for file %s from user %s", filename, user_id)
-
-    conn, err := net.Dial("tcp", addr)
-    if err != nil {
-        return false, err
-    }
-    defer conn.Close()  // 연결 종료 추가
-
-    stream := transport.NewTCPStream(conn)
-
-    request := &transport.Message{
-        Category:  transport.MessageCategory_REQUEST,
-        Operation: transport.MessageOperation_HASFILE,
-        Payload: &transport.RequestPayload{
-            HasFile: &transport.HasFileRequest{
-                UserID:   user_id,
-                Filename: filename,
-            },
-        },
-    }
-    if err := stream.Send(request); err != nil {
-        return false, err
-    }
-    msg, err := stream.CloseAndRecv()
-    if err != nil {
-        return false, err
-    }
-    payload, ok := msg.Payload.(*transport.ResponsePayload)
-
-    if !ok || payload.HasFile == nil {
-        return false, fmt.Errorf("error correct response")
-    }
-
-    return payload.HasFile.IsExist, nil
-}
 
 // node/master.go
 func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRequest) error {
 
-	fileExists,_ := m.HasFile(ctx,req.UserID, req.Filename)
+	fileExists,_,err := m.HasFile(ctx,req.UserID, req.Filename)
+
+    if err !=nil{
+        return fmt.Errorf("error: Can not connect KVS server")
+    }
 
     log.Printf("File exist %v",fileExists)
 
@@ -312,7 +273,7 @@ func (m *MasterNode) UploadFile(ctx context.Context, req *transport.UploadFileRe
 			// return m.handleOverwrite(ctx, req, stream)
             return nil
 		default:
-			return fmt.Errorf("can't")
+			return fmt.Errorf("error: Already Exist File")
 		}
 	} else {
 		return m.handleNewUpload(ctx, req)
@@ -325,15 +286,18 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     chunks := utils.SplitFileIntoChunks(req.Content)
     log.Printf("MasterNode: File split into %d chunks", len(chunks))
 
-    distribution := m.distributeChunks(chunks)
+    // distribution := m.distributeChunks(chunks)
+
+    selNodes := m.selectDataNode(1)
+
 
     var wg sync.WaitGroup
-    errChan := make(chan error, len(distribution))
+    errChan := make(chan error, 1)
 
     ctx, cancel := context.WithCancel(ctx)
     defer cancel()
 
-    for nodeID, nodeChunks := range distribution {
+    for _, node := range selNodes {
         wg.Add(1)
         go func(nodeID string, chunks []*transport.FileChunk) {
             defer wg.Done()
@@ -341,7 +305,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
                 errChan <- err
                 cancel()  // 에러가 발생하면 모든 고루틴 취소
             }
-        }(nodeID, nodeChunks)
+        }(node.ID, chunks)
     }
 
     go func() {
@@ -358,49 +322,83 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
 
+    nodeIDs := make([]string, len(selNodes))
+    for i, node := range selNodes {
+        nodeIDs[i] = node.ID
+    }
+
 
     metadata := kvclient.FileMetadata{
-        RetentionTime: time.Now().AddDate(0, 0, 90),  // 지금으로부터 90일 뒤
+        // RetentionTime: time.Now().AddDate(0, 0, 90),  // 지금으로부터 90일 뒤
         FileSize:      int64(len(req.Content)),
-        ChunkNodes:    []string{"node1"},
+        ChunkNodes:    nodeIDs,
     }
+
+    if req.RetentionPeriodDays>0{
+        metadata.RetentionTime = time.Now().AddDate(0,0,req.RetentionPeriodDays)
+    }else if req.RetentionPeriodDays==0{
+        metadata.RetentionTime = time.Now().AddDate(0,0,90)
+    }
+
     key := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
     metadataJSON, err := json.Marshal(metadata)
-
     if err !=nil{
         return err
     }
     // 현재 시간
     m.kvClient.Set(key, string(metadataJSON))
+    
+    if !metadata.RetentionTime.IsZero(){
+        delete_key := fmt.Sprintf("delete_file:%s:%s:%s",
+        metadata.RetentionTime.Format("20060102150405"),
+        req.UserID,
+        req.Filename)
+        m.kvClient.Set(delete_key, "")
+    }
 
     return nil
 }
 
 
-func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) ([]byte,error) {
+func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) ([]byte, error) {
     log.Printf("MasterNode: Starting download for file %s from user %s", req.Filename, req.UserID)
 
-    // stream := transport.NewTCPStream(conn)
-
-    // 모든 DataNode에 다운로드 요청 전송
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(m.dataNodes))
-    chunksChan := make(chan *transport.FileChunk, 100*100) // 버퍼 크기는 적절히 조정
-
-    for _, node := range m.dataNodes {
-        wg.Add(1)
-        go func(nodeID, addr string) {
-            defer wg.Done()
-            err := m.requestChunksFromDataNode(ctx, nodeID, addr, req.UserID, req.Filename, chunksChan)
-            if err != nil {
-                errChan <- err
-            }
-        }(node.ID, node.Addr)
+    // 파일 메타데이터 조회
+    hasFile, metadata, err := m.HasFile(ctx, req.UserID, req.Filename)
+    if err != nil {
+        return nil, fmt.Errorf("error checking file existence: %v", err)
+    }
+    if !hasFile {
+        return nil, fmt.Errorf("file not found: %s", req.Filename)
     }
 
-    // 청크 수집
+    // 청크가 저장된 노드 ID 확인
+    if len(metadata.ChunkNodes) == 0 {
+        return nil, fmt.Errorf("no chunk nodes found for file: %s", req.Filename)
+    }
+    nodeID := metadata.ChunkNodes[0] // 첫 번째 노드 선택 (필요에 따라 로드 밸런싱 로직 추가 가능)
+
+    // 선택된 노드의 주소 찾기
+    var nodeAddr string
+    for _, node := range m.dataNodes {
+        if node.ID == nodeID {
+            nodeAddr = node.Addr
+            break
+        }
+    }
+    if nodeAddr == "" {
+        return nil, fmt.Errorf("node address not found for node ID: %s", nodeID)
+    }
+
+    chunksChan := make(chan *transport.FileChunk, 100)
+    errChan := make(chan error, 1)
+
+    // 선택된 노드에서만 청크 요청
     go func() {
-        wg.Wait()
+        err := m.requestChunksFromDataNode(ctx, nodeID, nodeAddr, req.UserID, req.Filename, chunksChan)
+        if err != nil {
+            errChan <- err
+        }
         close(chunksChan)
         close(errChan)
     }()
@@ -412,26 +410,24 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
     }
 
     // 에러 확인
-    for err := range errChan {
-        if err != nil {
-            return nil,fmt.Errorf("error during download: %v", err)
-        }
+    if err := <-errChan; err != nil {
+        return nil, fmt.Errorf("error during download: %v", err)
     }
 
     // 청크를 정렬하고 합치기
     var sortedIndices []int
     for index := range chunks {
-        sortedIndices = append(sortedIndices, int(index))
+        sortedIndices = append(sortedIndices, index)
     }
     sort.Ints(sortedIndices)
 
     var fullFileContent []byte
     for _, index := range sortedIndices {
-        fullFileContent = append(fullFileContent, chunks[int(index)]...)
+        fullFileContent = append(fullFileContent, chunks[index]...)
     }
 
-    log.Printf("MasterNode: Successfully downloaded and sent file %s for user %s", req.Filename, req.UserID)
-    return fullFileContent,nil
+    log.Printf("MasterNode: Successfully downloaded file %s for user %s", req.Filename, req.UserID)
+    return fullFileContent, nil
 }
 
 func (m *MasterNode) requestChunksFromDataNode(ctx context.Context, nodeID, addr, userID, filename string, chunksChan chan<- *transport.FileChunk) error {
@@ -577,20 +573,16 @@ func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, f
 
 
 func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest)  error{
-	exists,nodes := m.HasFile(ctx,req.UserID, req.Filename)
+	exists,metaData,_ := m.HasFile(ctx,req.UserID, req.Filename)
 
     if !exists {
         return fmt.Errorf("file %s does not exist for user %s", req.Filename, req.UserID)
     }
 
     var wg sync.WaitGroup
-    errChan := make(chan error, len(nodes))
+    errChan := make(chan error, len(metaData.ChunkNodes))
 
-    for nodeID, hasFile := range nodes {
-        if !hasFile {
-            continue
-        }
-
+    for _,nodeID := range metaData.ChunkNodes {
         wg.Add(1)
         go func(nodeID string) {
             defer wg.Done()
@@ -710,17 +702,41 @@ func (m *MasterNode) Stop() {
 
 func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
     log.Printf("MasterNode: Received registration request from %v\n", req)
+
     nodeInfo := &DataNodeInfo{
         ID:   req.NodeID,
         Addr: req.Addr,
     }
 
     m.dataNodes[req.NodeID] = nodeInfo
-
+    m.nodeKeys = append(m.nodeKeys, req.NodeID)
 
     log.Printf("Registered DataNode: %s at %s", req.NodeID, req.Addr)
     return nil
 }
+
+
+func (mn *MasterNode) deleteDataNode(nodeID string){
+    mn.nodeMu.Lock()
+    defer mn.nodeMu.Unlock()
+
+    if _, exists := mn.dataNodes[nodeID]; !exists{
+        return
+    }
+
+    for i, key := range mn.nodeKeys{
+        if key == nodeID{
+            mn.nodeKeys = append(mn.nodeKeys[:i], mn.nodeKeys[i+1:]...)
+            break
+        }
+    }
+
+    if mn.currentIndex >= len(mn.nodeKeys){
+        mn.currentIndex = 0
+    }
+
+}
+
 
 func (m *MasterNode) Register(ctx context.Context, req *transport.RegisterMessage) error {
     log.Printf("Register method")
@@ -753,6 +769,35 @@ func (m *MasterNode) distributeChunks(chunks []*transport.FileChunk) map[string]
 
     return distribution
 }
+
+func (mn *MasterNode) selectDataNode(replica_num int) []*DataNodeInfo {
+    mn.nodeMu.Lock()
+    defer mn.nodeMu.Unlock()
+
+    selectedNodes := []*DataNodeInfo{}
+
+    if len(mn.nodeKeys) == 0 {
+        return nil // 노드가 없는 경우 빈 슬라이스 반환
+    }
+
+    // replica_num이 노드 수보다 크다면 모든 노드를 선택
+    if replica_num >= len(mn.nodeKeys) {
+        for _, key := range mn.nodeKeys {
+            selectedNodes = append(selectedNodes, mn.dataNodes[key])
+        }
+        return selectedNodes
+    }
+
+    // replica_num만큼의 노드를 선택
+    for i := 0; i < replica_num; i++ {
+        selKey := mn.nodeKeys[mn.currentIndex]
+        selectedNodes = append(selectedNodes, mn.dataNodes[selKey])
+        mn.currentIndex = (mn.currentIndex + 1) % len(mn.nodeKeys)
+    }
+
+    return selectedNodes
+}
+
 
 
 

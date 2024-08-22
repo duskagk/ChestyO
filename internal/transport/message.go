@@ -55,11 +55,12 @@ type ResponsePayload struct {
 
 // Request and Response types
 type UploadFileRequest struct {
-	UserID    string
-	Filename  string
-	FileSize  int64
-	Policy    enum.UploadPolicy
-    Content   []byte
+	UserID              string
+	Filename            string
+	FileSize            int64
+	Policy              enum.UploadPolicy
+    Content             []byte
+    RetentionPeriodDays int  // 새로 추가된 필드
 }
 
 type BaseResponse struct {

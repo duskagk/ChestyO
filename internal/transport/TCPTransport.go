@@ -16,6 +16,10 @@ type TCPTransport struct {
 }
 
 func NewTCPTransport(address string, handler FileService) (*TCPTransport, error) {
+    // addr, err := net.ResolveTCPAddr("tcp4", address)
+    // if err != nil {
+    //     return nil, err
+    // }
     listener, err := net.Listen("tcp", address)
     if err != nil {
         return nil, err

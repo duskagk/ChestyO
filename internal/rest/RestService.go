@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -75,6 +76,26 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    retentionPeriodStr := r.FormValue("retention_period_days")
+    var retentionPeriodDays int
+    if retentionPeriodStr != "" {
+        retentionPeriodDays, err = strconv.Atoi(retentionPeriodStr)
+        if err != nil {
+            http.Error(w, "Invalid retention period", http.StatusBadRequest)
+            return
+        }
+        // 유효성 검사: -1 (영구), 0 (기본값), 또는 양수
+        if retentionPeriodDays < -1 {
+            http.Error(w, "Retention period must be -1, 0, or a positive number", http.StatusBadRequest)
+            return
+        }
+    } else {
+        // 기본값 설정 (예: 0은 시스템 기본값 사용)
+        retentionPeriodDays = 0
+    }
+
+
+
     // 파일 내용 읽기
     content, err := io.ReadAll(file)
     if err != nil {
@@ -88,6 +109,7 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
         FileSize: header.Size,
         Policy:   policy,
         Content:  content,
+        RetentionPeriodDays: retentionPeriodDays,
     }
 
     err = h.masterService.UploadFile(opCtx, uploadRequest)

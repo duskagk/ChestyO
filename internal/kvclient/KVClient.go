@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -20,24 +21,34 @@ func NewKVClient(host string, port int) *KVClient {
 }
 
 func (c *KVClient) Set(key, value string) error {
-	data := map[string]string{key: value}
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal data: %v", err)
-	}
+    data := map[string]string{
+        key: value,
+    }
+    jsonData, err := json.Marshal(data)
+    if err != nil {
+        return fmt.Errorf("failed to marshal JSON: %v", err)
+    }
 
-	resp, err := http.Post(c.BaseURL+"/set", "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
+    req, err := http.NewRequest("POST", c.BaseURL+"/set", bytes.NewBuffer(jsonData))
+    if err != nil {
+        return fmt.Errorf("failed to create request: %v", err)
+    }
+    req.Header.Set("Content-Type", "application/json")
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return fmt.Errorf("failed to send request: %v", err)
+    }
+    defer resp.Body.Close()
 
-	return nil
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+    }
+
+    return nil
 }
+
 
 func (c *KVClient) Get(key string) (string, error) {
 	resp, err := http.Get(fmt.Sprintf("%s/get?key=%s", c.BaseURL, url.QueryEscape(key)))
@@ -46,21 +57,26 @@ func (c *KVClient) Get(key string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("failed to read response body: %v", err)
+		}
+
+		var result string
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", fmt.Errorf("failed to unmarshal response: %v", err)
+		}
+
+		return result, nil
+
+	case http.StatusNoContent:
+		return "", nil // 데이터가 없음을 나타내기 위해 빈 문자열과 nil 에러 반환
+
+	default:
 		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	var result map[string]string
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to unmarshal response: %v", err)
-	}
-
-	return result["value"], nil
 }
 
 func (c *KVClient) Delete(key string) error {

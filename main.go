@@ -38,7 +38,11 @@ func main() {
         if *httpAddr == "" {
             log.Fatal("HTTP address is required for master node")
         }
+        log.Printf("TCP addr : %v, HttpADDR : %v", *tcpAddr,*httpAddr)
         masterNode := node.NewMasterNode(*nodeID, *tcpAddr, *httpAddr,*numBuckets)
+        if masterNode == nil {
+            log.Fatal("Failed to create MasterNode")
+        }
         err = masterNode.Start(ctx)
     case "data":
         if *masterAddr == "" {
@@ -47,6 +51,9 @@ func main() {
         // err = node.RunDataNode(ctx, *nodeID, *tcpAddr, *masterAddr)
         
         dataNode := node.NewDataNode(*nodeID, store.StoreOpts{Root: fmt.Sprintf("./nfs/%s", *nodeID)}, *numBuckets)
+        if dataNode ==nil{
+            log.Fatalf("Failed to create Datanode")
+        }
         dataNode.Start(ctx,*tcpAddr, *masterAddr)
     default:
         log.Fatal("Invalid node type. Use 'master' or 'data'")
