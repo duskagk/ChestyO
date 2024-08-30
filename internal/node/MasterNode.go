@@ -234,7 +234,7 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
 }
 
 
-func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, *kvclient.FileMetadata, error) {
+func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, *transport.FileMetadata, error) {
     key := fmt.Sprintf("file:%s:%s", userID, filename)
     metadataJSON, err := m.kvClient.Get(key)
 
@@ -246,7 +246,7 @@ func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool
         return false, nil, nil
     }
 
-    var metadata kvclient.FileMetadata
+    var metadata transport.FileMetadata
     err = json.Unmarshal([]byte(metadataJSON), &metadata)
     if err != nil {
         return false, nil, fmt.Errorf("failed to unmarshal file metadata: %v", err)
@@ -254,6 +254,7 @@ func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool
 
     return true, &metadata, nil
 }
+
 
 
 // node/master.go
@@ -286,10 +287,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     chunks := utils.SplitFileIntoChunks(req.Content)
     log.Printf("MasterNode: File split into %d chunks", len(chunks))
 
-    // distribution := m.distributeChunks(chunks)
-
     selNodes := m.selectDataNode(1)
-
 
     var wg sync.WaitGroup
     errChan := make(chan error, 1)
@@ -297,16 +295,45 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     ctx, cancel := context.WithCancel(ctx)
     defer cancel()
 
+    chunkMetas := make(map[string]*transport.ChunkMetadata)
+    var chunkMetasMutex sync.Mutex
+
+
+    chunkMetaBatch := kvclient.NewKVBatch()
+
+
     for _, node := range selNodes {
-        wg.Add(1)
-        go func(nodeID string, chunks []*transport.FileChunk) {
-            defer wg.Done()
-            if err := m.sendChunksToDataNode(ctx, nodeID, req.UserID, req.Filename, chunks); err != nil {
-                errChan <- err
-                cancel()  // 에러가 발생하면 모든 고루틴 취소
-            }
-        }(node.ID, chunks)
+        conn, err := net.Dial("tcp",node.Addr)
+        if err!=nil{
+            errChan <- err
+        }
+        stream := transport.NewTCPStream(conn)
+        for i, chunk := range chunks{
+            wg.Add(1)
+            
+            go func(inx int,chunk *transport.FileChunk,nodeID string){
+                defer wg.Done()
+                if err := m.sendChunkToDataNode(ctx,stream,req.UserID,req.Filename,chunk); err!=nil{
+                    errChan <- err
+                }
+                
+                chunkKey := fmt.Sprintf("chunk:%s:%s:%05d", req.UserID, req.Filename, inx)
+                
+                chunkMetasMutex.Lock()
+                if _, exists := chunkMetas[chunkKey]; !exists {
+                    chunkMetas[chunkKey] = &transport.ChunkMetadata{
+                        ChunkIndex: inx,
+                        NodeID:     []string{},
+                        Size:       int64(len(chunk.Content)),
+                    }
+                }
+                chunkMetas[chunkKey].NodeID = append(chunkMetas[chunkKey].NodeID, nodeID)
+                chunkMetasMutex.Unlock()
+            }(i,chunk,node.ID)
+        }
     }
+
+
 
     go func() {
         wg.Wait()
@@ -320,6 +347,11 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
         }
     }
 
+    for key,chunk_meta := range chunkMetas{
+        metaJSON, _ := json.Marshal(chunk_meta)
+        chunkMetaBatch.Add(key,string(metaJSON))
+    }
+
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
 
     nodeIDs := make([]string, len(selNodes))
@@ -328,10 +360,12 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     }
 
 
-    metadata := kvclient.FileMetadata{
-        // RetentionTime: time.Now().AddDate(0, 0, 90),  // 지금으로부터 90일 뒤
+    metadata := transport.FileMetadata{
         FileSize:      int64(len(req.Content)),
         ChunkNodes:    nodeIDs,
+        ContentType: req.FileContentType,
+        TotalChunks: int64(len(chunks)),
+        ChunkSize: utils.ChunkSize,
     }
 
     if req.RetentionPeriodDays>0{
@@ -356,14 +390,18 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
         m.kvClient.Set(delete_key, "")
     }
 
+    if err := m.kvClient.BatchSet(chunkMetaBatch.GetPairs()); err != nil {
+        log.Printf("MasterNode: Error setting chunk metadata: %v", err)
+        return err
+    }
+
     return nil
 }
 
 
-func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) ([]byte, error) {
+func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) ([]*transport.FileChunk, error) {
     log.Printf("MasterNode: Starting download for file %s from user %s", req.Filename, req.UserID)
 
-    // 파일 메타데이터 조회
     hasFile, metadata, err := m.HasFile(ctx, req.UserID, req.Filename)
     if err != nil {
         return nil, fmt.Errorf("error checking file existence: %v", err)
@@ -372,204 +410,178 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
         return nil, fmt.Errorf("file not found: %s", req.Filename)
     }
 
-    // 청크가 저장된 노드 ID 확인
-    if len(metadata.ChunkNodes) == 0 {
-        return nil, fmt.Errorf("no chunk nodes found for file: %s", req.Filename)
-    }
-    nodeID := metadata.ChunkNodes[0] // 첫 번째 노드 선택 (필요에 따라 로드 밸런싱 로직 추가 가능)
+    var startChunk int64
+    var endChunk int64
 
-    // 선택된 노드의 주소 찾기
-    var nodeAddr string
-    for _, node := range m.dataNodes {
-        if node.ID == nodeID {
-            nodeAddr = node.Addr
-            break
+    if req.End ==-1{
+        startChunk = 0
+        endChunk = metadata.TotalChunks
+    }else{
+        startChunk = req.Start / metadata.ChunkSize
+        endChunk = req.End / metadata.ChunkSize
+    
+        if endChunk-startChunk > 10 {
+            endChunk = startChunk + 10
         }
     }
-    if nodeAddr == "" {
-        return nil, fmt.Errorf("node address not found for node ID: %s", nodeID)
+
+
+    prefix := fmt.Sprintf("chunk:%s:%s", req.UserID, req.Filename)
+    cursor := fmt.Sprintf("%s:%05d", prefix, startChunk)
+
+    chunkMetadata, _, err := m.kvClient.ScanValueByKey(prefix, cursor, int(endChunk-startChunk))
+    if err != nil {
+        return nil, fmt.Errorf("error fetching chunk metadata: %v", err)
     }
 
-    chunksChan := make(chan *transport.FileChunk, 100)
-    errChan := make(chan error, 1)
+    chunksChan := make(chan *transport.FileChunk, endChunk-startChunk)
+    errChan := make(chan error, endChunk-startChunk)
+    var wg sync.WaitGroup
 
-    // 선택된 노드에서만 청크 요청
+    for _, chunkData := range chunkMetadata {
+        wg.Add(1)
+        var chunkMeta transport.ChunkMetadata
+        if err := json.Unmarshal([]byte(chunkData["value"]), &chunkMeta); err != nil {
+            log.Printf("Error unmarshaling chunk metadata: %v", err)
+            wg.Done()
+            continue
+        }
+        go func(chunk_meta transport.ChunkMetadata) {
+            defer wg.Done()
+
+            res_chunk, err := m.requestChunkStream(ctx, chunk_meta.NodeID[0], chunk_meta.ChunkIndex, req)
+            if err != nil {
+                log.Printf("Error requesting chunk %d: %v", chunk_meta.ChunkIndex, err)
+                errChan <- err
+            }
+
+            if chunk_meta.ChunkIndex == int(startChunk) {
+                res_chunk.Content = res_chunk.Content[req.Start%metadata.ChunkSize:]
+            }
+
+            chunksChan <- res_chunk
+            
+            log.Printf("Push Chunk Channel Index %v Len %v", res_chunk.Index, len(res_chunk.Content))
+
+        }(chunkMeta)
+    }
+
     go func() {
-        err := m.requestChunksFromDataNode(ctx, nodeID, nodeAddr, req.UserID, req.Filename, chunksChan)
-        if err != nil {
-            errChan <- err
-        }
+        wg.Wait()
         close(chunksChan)
-        close(errChan)
     }()
 
-    // 청크를 수집하여 완전한 파일로 만들기
-    chunks := make(map[int][]byte)
+    // Collect all chunks from the channel
+    var chunks []*transport.FileChunk
     for chunk := range chunksChan {
-        chunks[chunk.Index] = chunk.Content
+        chunks = append(chunks, chunk)
+        req.Length += int64(len(chunk.Content))
     }
 
-    // 에러 확인
-    if err := <-errChan; err != nil {
-        return nil, fmt.Errorf("error during download: %v", err)
-    }
+    // Sort chunks by ChunkIndex
+    sort.Slice(chunks, func(i, j int) bool {
+        return chunks[i].Index < chunks[j].Index
+    })
 
-    // 청크를 정렬하고 합치기
-    var sortedIndices []int
-    for index := range chunks {
-        sortedIndices = append(sortedIndices, index)
-    }
-    sort.Ints(sortedIndices)
-
-    var fullFileContent []byte
-    for _, index := range sortedIndices {
-        fullFileContent = append(fullFileContent, chunks[index]...)
-    }
-
-    log.Printf("MasterNode: Successfully downloaded file %s for user %s", req.Filename, req.UserID)
-    return fullFileContent, nil
+    return chunks, nil
 }
 
-func (m *MasterNode) requestChunksFromDataNode(ctx context.Context, nodeID, addr, userID, filename string, chunksChan chan<- *transport.FileChunk) error {
-    conn, err := net.Dial("tcp", addr)
-    if err != nil {
-        return fmt.Errorf("failed to connect to DataNode %s: %v", nodeID, err)
+func (m *MasterNode) requestChunkStream(ctx context.Context,node_id string,chunk_index int,req *transport.DownloadFileRequest) (*transport.FileChunk,error){
+    conn, err := net.Dial("tcp", m.dataNodes[node_id].Addr)
+    
+    if err!=nil{
+        return nil,fmt.Errorf("failed to connect to DataNode %s: %v", node_id, err)
     }
     defer conn.Close()
 
     stream := transport.NewTCPStream(conn)
-
     request := &transport.Message{
         Category:  transport.MessageCategory_REQUEST,
         Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
         Payload: &transport.RequestPayload{
             DownLoadChunk: &transport.DownloadChunkRequest{
-                UserID:   userID,
-                Filename: filename,
+                UserID:   req.UserID,
+                Filename: req.Filename,
+                ChunkIndex: chunk_index,
             },
         },
     }
 
     if err := stream.Send(request); err != nil {
-        return fmt.Errorf("failed to send download request to DataNode %s: %v", nodeID, err)
+        return nil,fmt.Errorf("failed to send download request to DataNode %s: %v", node_id, err)
     }
 
-    log.Printf("Start Get Data %s", nodeID)
-    for {
-        response, err := stream.Recv()
-        if err == io.EOF {
-            log.Printf("The stream from DataNode %s is end", nodeID)
-            break
-        }
-        if err != nil {
-            return fmt.Errorf("error receiving chunk from DataNode %s: %v", nodeID, err)
-        }
-
-        if response.Category == transport.MessageCategory_RESPONSE && response.Operation == transport.MessageOperation_DOWNLOAD_CHUNK {
-            payload, ok := response.Payload.(*transport.ResponsePayload)
-            if !ok || payload.DownloadChunk == nil {
-                return fmt.Errorf("invalid payload for download chunk from DataNode %s", nodeID)
-            }
-            if payload.DownloadChunk.Success && payload.DownloadChunk.Message == "All chunks sent" {
-                log.Printf("All chunks received from DataNode %s", nodeID)
-                break
-            }
-            // log.Printf("Receive Data %v", &payload.DownloadChunk.Chunk)
-            chunksChan <- &payload.DownloadChunk.Chunk
-        }
+    response, err := stream.Recv()
+    if err == io.EOF {
+        return nil,fmt.Errorf("The stream from DataNode %s is end", node_id)
     }
-
-    return nil
-}
-
-
-
-func (m *MasterNode) sendChunksToDataNode(ctx context.Context, nodeID, userID, filename string, chunks []*transport.FileChunk) error {
-    log.Printf("Starting to send %d chunks to node %s for file %s", len(chunks), nodeID, filename)
-    
-    node, ok := m.dataNodes[nodeID]
-    if !ok {
-        return fmt.Errorf("DataNode %s not found", nodeID)
-    }
-
-    conn, err := net.DialTimeout("tcp", node.Addr, 15*time.Second)
     if err != nil {
-        return fmt.Errorf("failed to connect to DataNode %s: %v", nodeID, err)
-    }
-    defer conn.Close()
-
-    stream := transport.NewTCPStream(conn)
-
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(chunks))
-
-    for i, chunk := range chunks {
-        wg.Add(1)
-        go func(i int, chunk *transport.FileChunk) {
-            defer wg.Done()
-            select {
-            case <-ctx.Done():
-                errChan <- ctx.Err()
-                return
-            default:
-                log.Printf("Sending chunk %d/%d to node %s", i+1, len(chunks), nodeID)
-                msg := &transport.Message{
-                    Category:  transport.MessageCategory_REQUEST,
-                    Operation: transport.MessageOperation_UPLOAD_CHUNK,
-                    Payload: &transport.RequestPayload{
-                        UploadChunk: &transport.UploadFileChunkRequest{
-                            UserID:   userID,
-                            Filename: filename,
-                            Chunk:    *chunk,
-                        },
-                    },
-                }
-                err := stream.Send(msg)
-                if err != nil {
-                    errChan <- fmt.Errorf("failed to send chunk %d: %v", i+1, err)
-                    return
-                }
-
-                // 각 청크 전송 후 응답 대기
-                response, err := stream.Recv()
-                if err != nil {
-                    errChan <- fmt.Errorf("failed to receive response for chunk %d: %v", i+1, err)
-                    return
-                }
-
-                if response.Category != transport.MessageCategory_RESPONSE || response.Operation != transport.MessageOperation_UPLOAD_CHUNK {
-                    errChan <- fmt.Errorf("unexpected response for chunk %d: %v", i+1, response)
-                    return
-                }
-
-                payload, ok := response.Payload.(*transport.ResponsePayload)
-                if !ok || payload.UploadChunk == nil {
-                    errChan <- fmt.Errorf("invalid response payload for chunk %d", i+1)
-                    return
-                }
-
-                if !payload.UploadChunk.Success {
-                    errChan <- fmt.Errorf("upload failed for chunk %d: %s", i+1, payload.UploadChunk.Message)
-                    return
-                }
-            }
-        }(i, chunk)
+        return nil,fmt.Errorf("error receiving chunk from DataNode %s: %v", node_id, err)
     }
 
-    go func() {
-        wg.Wait()
-        close(errChan)
-    }()
-
-    for err := range errChan {
-        if err != nil {
-            return err
+    if response.Category == transport.MessageCategory_RESPONSE && response.Operation == transport.MessageOperation_DOWNLOAD_CHUNK {
+        payload, ok := response.Payload.(*transport.ResponsePayload)
+        if !ok || payload.DownloadChunk == nil {
+            return nil,fmt.Errorf("invalid payload for download chunk from DataNode %s", node_id)
         }
+        if payload.DownloadChunk.Success && payload.DownloadChunk.Message == "All chunks sent" {
+            log.Printf("All chunks received from DataNode %s", node_id)
+        }
+        return &payload.DownloadChunk.Chunk,nil
     }
-
-    log.Printf("Successfully uploaded all chunks to node %s", nodeID)
-    return nil
+    return nil,fmt.Errorf("No Data request")
 }
+
+
+func (m *MasterNode) sendChunkToDataNode(ctx context.Context, stream *transport.StreamService, userID, filename string, chunk *transport.FileChunk) error {
+    select {
+    case <-ctx.Done():
+        return ctx.Err()
+    default:
+        // log.Printf("Sending chunk %d for file %s", chunk.Index, filename)
+
+        msg := &transport.Message{
+            Category:  transport.MessageCategory_REQUEST,
+            Operation: transport.MessageOperation_UPLOAD_CHUNK,
+            Payload: &transport.RequestPayload{
+                UploadChunk: &transport.UploadFileChunkRequest{
+                    UserID:   userID,
+                    Filename: filename,
+                    Chunk:    *chunk,
+                },
+            },
+        }
+
+        err := stream.Send(msg)
+        if err != nil {
+            return fmt.Errorf("failed to send chunk %d: %v", chunk.Index, err)
+        }
+
+        // 청크 전송 후 응답 대기
+        response, err := stream.Recv()
+        if err != nil {
+            return fmt.Errorf("failed to receive response for chunk %d: %v", chunk.Index, err)
+        }
+
+        if response.Category != transport.MessageCategory_RESPONSE || response.Operation != transport.MessageOperation_UPLOAD_CHUNK {
+            return fmt.Errorf("unexpected response for chunk %d: %v", chunk.Index, response)
+        }
+
+        payload, ok := response.Payload.(*transport.ResponsePayload)
+        if !ok || payload.UploadChunk == nil {
+            return fmt.Errorf("invalid response payload for chunk %d", chunk.Index)
+        }
+
+        if !payload.UploadChunk.Success {
+            return fmt.Errorf("upload failed for chunk %d: %s", chunk.Index, payload.UploadChunk.Message)
+        }
+
+        // log.Printf("Successfully uploaded chunk %d for file %s", chunk.Index, filename)
+        return nil
+    }
+}
+
+
 
 
 func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest)  error{
@@ -608,6 +620,22 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
     for err := range errChan {
         if err != nil {
             errs = append(errs, err)
+        }
+    }
+
+
+    metaKey := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
+    if err := m.kvClient.Delete(metaKey); err !=nil{
+        errs = append(errs, fmt.Errorf("failed to delete metadata: %v",err))
+    }
+
+    if !metaData.RetentionTime.IsZero(){
+        delete_key := fmt.Sprintf("delete_file:%s:%s:%s",
+        metaData.RetentionTime.Format("20060102150405"),
+        req.UserID,
+        req.Filename)
+        if err := m.kvClient.Delete(delete_key); err !=nil{
+            errs = append(errs, fmt.Errorf("to delete key : %v",err))
         }
     }
 

@@ -146,42 +146,46 @@ func (d *DataNode) handleDownloadChunks(ctx context.Context, stream transport.TC
     req := payload.DownLoadChunk
     log.Printf("DataNode %s: Processing download request for file %s, user %s", d.ID, req.Filename, req.UserID)
 
-    chunks, err := d.ReadAllChunks(req.UserID, req.Filename)
+    // chunks, err := d.ReadAllChunks(req.UserID, req.Filename)
+
+    chunk, err := d.readChunkIndex(req.UserID, req.Filename,req.ChunkIndex)
+
     if err != nil {
         return fmt.Errorf("failed to read chunks: %v", err)
     }
 
-    for index, content := range chunks {
-        response := &transport.Message{
-            Category:  transport.MessageCategory_RESPONSE,
-            Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
-            Payload: &transport.ResponsePayload{
-                DownloadChunk: &transport.DownloadChunkResponse{
-                    Chunk: transport.FileChunk{
-                        Index:   index,
-                        Content: content,
-                    },
-                },
-            },
-        }
-        if err := stream.Send(response); err != nil {
-            return fmt.Errorf("failed to send chunk response: %v", err)
-        }
-    }
-
-    // 모든 청크를 전송한 후 스트림 종료
-    return stream.SendAndClose(&transport.Message{
+    // for index, content := range chunks {
+    response := &transport.Message{
         Category:  transport.MessageCategory_RESPONSE,
         Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
         Payload: &transport.ResponsePayload{
             DownloadChunk: &transport.DownloadChunkResponse{
-                BaseResponse: transport.BaseResponse{
-                    Success: true,
-                    Message: "All chunks sent",
+                Chunk: transport.FileChunk{
+                    Index:   req.ChunkIndex,
+                    Content: chunk,
                 },
             },
         },
-    })
+    }
+    if err := stream.Send(response); err != nil {
+        return fmt.Errorf("failed to send chunk response: %v", err)
+    }
+    // }
+
+    // 모든 청크를 전송한 후 스트림 종료
+    // return stream.Send(&transport.Message{
+    //     Category:  transport.MessageCategory_RESPONSE,
+    //     Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
+    //     Payload: &transport.ResponsePayload{
+    //         DownloadChunk: &transport.DownloadChunkResponse{
+    //             BaseResponse: transport.BaseResponse{
+    //                 Success: true,
+    //                 Message: "All chunks sent",
+    //             },
+    //         },
+    //     },
+    // })
+    return nil
 }
 
 
@@ -475,6 +479,38 @@ func (d *DataNode) ReadChunk(userId, filename, chunkName string) ([]byte, error)
 	return data, nil
 }
 
+func (d *DataNode) readChunkIndex(userId, filename string, chunkIndex int) ([]byte, error) {
+    fmt.Printf("DataNode %s: Attempting to read chunk %d of file %s for user %s\n", d.ID, chunkIndex, filename, userId)
+
+    // 청크 파일 이름 생성
+    chunkName := fmt.Sprintf("%s_chunk_%d", filename, chunkIndex)
+
+    // PathTransformFunc 적용 (필요한 경우)
+    pathKey := d.store.PathTransformFunc(filename)
+    fullPath := filepath.Join(d.store.Root, userId, pathKey.Pathname, chunkName)
+
+    // 파일 존재 여부 확인
+    if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+        return nil, fmt.Errorf("chunk %d does not exist for file %s", chunkIndex, filename)
+    }
+
+    // 청크 읽기
+    size, reader, err := d.store.Read(userId, filename, chunkName)
+    if err != nil {
+        fmt.Printf("DataNode %s: Error reading chunk %d of file %s: %v\n", d.ID, chunkIndex, filename, err)
+        return nil, err
+    }
+
+    // 데이터 읽기
+    data, err := io.ReadAll(reader)
+    if err != nil {
+        fmt.Printf("DataNode %s: Error reading data from reader for chunk %d of file %s: %v\n", d.ID, chunkIndex, filename, err)
+        return nil, err
+    }
+
+    fmt.Printf("DataNode %s: Successfully read chunk %d of file %s. Size: %d bytes\n", d.ID, chunkIndex, filename, size)
+    return data, nil
+}
 
 func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
     conn, err := net.Dial("tcp", masterAddr)

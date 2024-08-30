@@ -3,6 +3,7 @@ package rest
 import (
 	"ChestyO/internal/enum"
 	"ChestyO/internal/transport"
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -11,10 +12,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
+
+// expiry 현재 시간에서 + expiry * second 으로 설정
+// expiry 없을 시 default 값 7 days
+var secretKey = []byte("a-very-secret-key-32-bytes-long!") // 실제 사용 시 안전하게 관리해야 함
+
+type FileInfo struct {
+    UserID    string    `json:"uid"`
+    Filename  string    `json:"fn"`
+    Expiration time.Time `json:"exp"`
+}
+
+var requestBody struct {
+    UserID   string `json:"user_id"`
+    Filename string `json:"filename"`
+}
 
 type RESTService interface {
     HandleUpload(w http.ResponseWriter, r *http.Request)
@@ -45,16 +63,21 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
-
-    // 최대 파일 크기 설정 (예: 10MB)
-    // r.ParseMultipartForm(10 << 20)
-
     file, header, err := r.FormFile("file")
     if err != nil {
         http.Error(w, "Error retrieving the file", http.StatusBadRequest)
         return
     }
     defer file.Close()
+
+
+    fileContentType := header.Header.Get("Content-Type")
+
+    if fileContentType == "" {
+        http.Error(w, "No Mime type in file", http.StatusBadRequest)
+        return
+    }
+
 
     userID := r.FormValue("user_id")
     if userID == "" {
@@ -94,8 +117,6 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
         retentionPeriodDays = 0
     }
 
-
-
     // 파일 내용 읽기
     content, err := io.ReadAll(file)
     if err != nil {
@@ -110,6 +131,7 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
         Policy:   policy,
         Content:  content,
         RetentionPeriodDays: retentionPeriodDays,
+        FileContentType : fileContentType,
     }
 
     err = h.masterService.UploadFile(opCtx, uploadRequest)
@@ -120,6 +142,46 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
  
     w.WriteHeader(http.StatusOK)
     json.NewEncoder(w).Encode(map[string]string{"message": "File uploaded successfully"})
+}
+
+// 그냥 다운로드(만일을 위해)
+func (h *RESTHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+
+    opCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+    defer cancel()
+
+    userID := r.URL.Query().Get("user_id")
+    filename := r.URL.Query().Get("filename")
+
+    if userID == "" || filename == "" {
+        http.Error(w, "Missing user_id or filename", http.StatusBadRequest)
+        return
+    }
+
+    // exists, metadata, err := h.masterService.H(r.Context(), userID, filename)
+
+    downloadRequest := &transport.DownloadFileRequest{
+        Filename: requestBody.Filename,
+        UserID: requestBody.UserID,
+    }
+
+    chunkChan,err := h.masterService.DownloadFile(opCtx,downloadRequest)
+    if err !=nil{
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    if chunkChan!=nil{
+
+        }else{
+            w.WriteHeader(http.StatusOK)
+        }
+    
+    // json.NewEncoder(w).Encode(map[string]string{"message": "File download successfully","file":string(file)})
 }
 
 func (h *RESTHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
@@ -165,15 +227,6 @@ func (h *RESTHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 
-// expiry 현재 시간에서 + expiry * second 으로 설정
-// expiry 없을 시 default 값 7 days
-var secretKey = []byte("a-very-secret-key-32-bytes-long!") // 실제 사용 시 안전하게 관리해야 함
-
-type FileInfo struct {
-    UserID    string    `json:"uid"`
-    Filename  string    `json:"fn"`
-    Expiration time.Time `json:"exp"`
-}
 
 func createToken(userID, filename string, expiry int) (string, error) {
     if expiry == 0 {
@@ -267,9 +320,6 @@ func (h *RESTHandler) HandleShareToken(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(map[string]string{"token": token})
 }
 
-func (h *RESTHandler) getFile(ctx context.Context, req *transport.DownloadFileRequest) ([]byte, error) {
-    return h.masterService.DownloadFile(ctx, req)
-}
 
 func (h *RESTHandler) HandleShareFileByToken(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodGet {
@@ -277,80 +327,104 @@ func (h *RESTHandler) HandleShareFileByToken(w http.ResponseWriter, r *http.Requ
         return
     }
 
-    token := r.URL.Query().Get("token")
-    if token == "" {
-        http.Error(w, "Token is required", http.StatusBadRequest)
+
+    filename := r.URL.Query().Get("filename")
+    username := r.URL.Query().Get("user")
+    metadataOnly := r.URL.Query().Get("metadata") == "true"
+
+    exists, metadata, err := h.masterService.HasFile(r.Context(), username, filename)
+    if !exists || err != nil {
+        http.Error(w,fmt.Errorf("not Found File").Error() , http.StatusBadRequest)
         return
     }
 
-    fileInfo, err := validateToken(token)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
+    log.Printf("File Exist Check And metadata : %v %v", exists, metadata)
+
+    if metadataOnly {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(metadata)
         return
     }
 
-    ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+    rangeHeader := r.Header.Get("Range")
+    start, end := int64(0), metadata.FileSize-1
+
+    if rangeHeader != "" {
+        if strings.HasPrefix(rangeHeader, "bytes=") {
+            rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
+            rangeParts := strings.Split(rangeStr, "-")
+            if len(rangeParts) == 2 {
+                start, _ = strconv.ParseInt(rangeParts[0], 10, 64)
+                if rangeParts[1] != "" {
+                    end, _ = strconv.ParseInt(rangeParts[1], 10, 64)
+                }else{
+                    end = metadata.FileSize-1
+                }
+            }
+        }
+    }else{
+        start = 0
+        end = -1
+    }
+
+    ctx, cancel := context.WithCancel(r.Context())
     defer cancel()
 
+    
     downloadRequest := &transport.DownloadFileRequest{
-        Filename: fileInfo.Filename,
-        UserID:   fileInfo.UserID,
+        Filename: filename,
+        UserID:   username,
+        Start:    start,
+        End:      end,
     }
 
-    fileContent, err := h.getFile(ctx, downloadRequest)
+    chunks, err := h.masterService.DownloadFile(ctx, downloadRequest)
     if err != nil {
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
 
-    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", fileInfo.Filename))
-    w.Header().Set("Content-Type", "application/octet-stream")
-    w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fileContent)))
-
-    _, err = w.Write(fileContent)
-    if err != nil {
-        http.Error(w, "Error writing file to response", http.StatusInternalServerError)
-        return
+    totalLength := int64(0)
+    for _, chunk := range chunks {
+        totalLength += int64(len(chunk.Content))
     }
+
+    w.Header().Set("Content-Type", metadata.ContentType)
+    w.Header().Set("Accept-Ranges", "bytes")
+    w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", filename))
+    w.Header().Set("Content-Length", fmt.Sprintf("%d", totalLength))
+
+
+    if rangeHeader != "" {
+        log.Printf("Content Range End : %v", downloadRequest.End)
+        w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.FileSize))
+        w.WriteHeader(http.StatusPartialContent)
+    } else {
+        w.WriteHeader(http.StatusOK)
+    }
+
+    for _, chunk := range chunks {
+        select {
+        case <-ctx.Done():
+            log.Println("Client disconnected during response")
+            return
+        default:
+            reader := bytes.NewReader(chunk.Content)
+            bytesWritten, err := io.Copy(w, reader)
+            // bytesWritten, err := w.Write(chunk.Content)
+            if err != nil {
+                log.Printf("Error writing to response: %v", err)
+                return
+            }
+            log.Printf("Written by IO Copy %v byte", bytesWritten)
+    
+            if f, ok := w.(http.Flusher); ok {
+                f.Flush()
+            }
+        }
+    }
+
 }
 
-// 그냥 다운로드(만일을 위해)
-func (h *RESTHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
-    opCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-    defer cancel()
 
-    if r.Method != http.MethodPost {
-        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-        return
-    }
 
-    contentType := r.Header.Get("Content-Type")
-    if contentType != "application/json" {
-        http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
-        return
-    }
-
-    var requestBody struct {
-        UserID   string `json:"user_id"`
-        Filename string `json:"filename"`
-    }
-
-    err := json.NewDecoder(r.Body).Decode(&requestBody)
-    if err != nil {
-        http.Error(w, "Invalid request body", http.StatusBadRequest)
-        return
-    }
-
-    downloadRequest := &transport.DownloadFileRequest{
-        Filename: requestBody.Filename,
-        UserID: requestBody.UserID,
-    }
-
-    file,err := h.masterService.DownloadFile(opCtx,downloadRequest)
-    if err !=nil{
-        http.Error(w, err.Error(), http.StatusInternalServerError)
-        return
-    }
-    w.WriteHeader(http.StatusOK)
-    json.NewEncoder(w).Encode(map[string]string{"message": "File download successfully","file":string(file)})
-}

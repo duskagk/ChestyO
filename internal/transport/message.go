@@ -3,6 +3,7 @@ package transport
 import (
 	"ChestyO/internal/enum"
 	"encoding/gob"
+	"time"
 )
 
 type MessageCategory int
@@ -61,6 +62,7 @@ type UploadFileRequest struct {
 	Policy              enum.UploadPolicy
     Content             []byte
     RetentionPeriodDays int  // 새로 추가된 필드
+    FileContentType     string
 }
 
 type BaseResponse struct {
@@ -83,8 +85,11 @@ type DownloadFileResponse struct {
 
 
 type DownloadFileRequest struct {
-	Filename string
-	UserID   string
+	Filename    string
+	UserID      string
+    Start       int64
+    End         int64
+    Length      int64
 }
 
 type DeleteFileRequest struct {
@@ -114,6 +119,9 @@ type UploadFileChunkRequest struct {
 type DownloadChunkRequest struct{
     UserID     string
     Filename   string
+    ChunkIndex int
+    StartByte int64
+    EndByte   int64
 }
 
 type FileChunk struct {
@@ -133,11 +141,19 @@ type FileDownloadStream struct {
 }
 
 type FileMetadata struct {
-	Filename    string
-	Version     int
-	ChunkMap    map[int]string // 청크 인덱스 -> 청크 파일 이름
-	TotalChunks int
+    RetentionTime   time.Time       `json:"retentionTime"`
+    FileSize        int64           `json:"fileSize"`
+    ChunkNodes      []string        `json:"chunkNodes"`
+    ContentType     string          `json:"contentType"`
+    TotalChunks     int64           `json:"totalChunks"`
+    ChunkSize       int64           `json:"chunkSize"`
 }
+type ChunkMetadata struct {
+    ChunkIndex  int                 `json:"chunkIndex"`
+    NodeID      []string            `json:"nodeID"`
+    Size        int64               `json:"size"`
+}
+
 
 type RegisterMessage struct{
 	NodeID      string

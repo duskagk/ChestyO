@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 var allowedIPs = []string{
@@ -23,10 +24,14 @@ func NewServer(masterNode transport.MasterFileService, addr string) *RestServer 
     return &RestServer{
         server: &http.Server{
             Addr: addr,
+            ReadTimeout:  10 * time.Minute,
+            WriteTimeout: 10 * time.Minute,
         },
         handler: NewRESTHandler(masterNode),
     }
 }
+
+
 
 func ipFilterMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

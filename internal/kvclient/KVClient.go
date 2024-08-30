@@ -50,6 +50,38 @@ func (c *KVClient) Set(key, value string) error {
 }
 
 
+func (c *KVClient) BatchSet(pairs []KVPair) error {
+    data := make(map[string]string)
+    for _, pair := range pairs {
+        data[pair.Key] = pair.Value
+    }
+
+    jsonData, err := json.Marshal(data)
+    if err != nil {
+        return fmt.Errorf("failed to marshal JSON: %v", err)
+    }
+
+    req, err := http.NewRequest("POST", c.BaseURL+"/set", bytes.NewBuffer(jsonData))
+    if err != nil {
+        return fmt.Errorf("failed to create request: %v", err)
+    }
+    req.Header.Set("Content-Type", "application/json")
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return fmt.Errorf("failed to send request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+    }
+
+    return nil
+}
+
+
 func (c *KVClient) Get(key string) (string, error) {
 	resp, err := http.Get(fmt.Sprintf("%s/get?key=%s", c.BaseURL, url.QueryEscape(key)))
 	if err != nil {
@@ -120,4 +152,30 @@ func (c *KVClient) RangeQuery(startKey, endKey string) (map[string]string, error
 	}
 
 	return result, nil
+}
+
+
+func (c *KVClient) ScanValueByKey(prefix string, cursor string, limit int) ([]map[string]string, string, error) {
+    url := fmt.Sprintf("%s/scanvaluebykey?prefix=%s&cursor=%s&limit=%d", 
+        c.BaseURL, url.QueryEscape(prefix), url.QueryEscape(cursor), limit)
+    
+    resp, err := http.Get(url)
+    if err != nil {
+        return nil, "", fmt.Errorf("failed to send request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+    }
+
+    var result struct {
+        Results    []map[string]string `json:"results"`
+        NextCursor string              `json:"nextCursor"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, "", fmt.Errorf("failed to decode response: %v", err)
+    }
+
+    return result.Results, result.NextCursor, nil
 }
