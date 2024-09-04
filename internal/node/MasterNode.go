@@ -16,15 +16,13 @@ import (
 	"log"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 
-type DataNodeInfo struct {
-    ID              string
-    Addr            string
-}
+
 
 type MasterNode struct {
     ID              string
@@ -32,15 +30,15 @@ type MasterNode struct {
     tcpTransport    *transport.TCPTransport
     restServer      *rest.RestServer
     stopChan        chan struct{}
-    kvClient        *kvclient.KVClient
+    kvServer        *kvclient.KVClient
     nodeMu          sync.Mutex
-    nodeKeys     []string                 // 맵의 키를 저장할 리스트
-	currentIndex int                      // 현재 라운드 로빈 인덱스
+    nodeKeys        []string                 // 맵의 키를 저장할 리스트
+	currentIndex    int                      // 현재 라운드 로빈 인덱스
 }
 
-func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
+func NewMasterNode(tcpAddr, httpAddr string) *MasterNode {
     m := &MasterNode{
-        ID:             id,
+        // ID:             id,
         dataNodes:      make(map[string]*DataNodeInfo),
         stopChan:       make(chan struct{}),
     }
@@ -61,7 +59,7 @@ func NewMasterNode(id,tcpAddr, httpAddr string, bucknum int) *MasterNode {
         return nil
     }
 
-    m.kvClient = kvclient.NewKVClient(cfg.KVServer.Server.Host,cfg.KVServer.Server.Port)
+    m.kvServer = kvclient.NewKVClient(cfg.KVServer.Server.Host,cfg.KVServer.Server.Port)
 
     return m
 }
@@ -72,10 +70,8 @@ func (m *MasterNode)TCPProtocl(ctx context.Context, conn net.Conn){
 }
 
 func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
-    // defer conn.Close()
-    // decoder := gob.NewDecoder(conn)
     stream := transport.NewTCPStream(conn)
-    // for {
+
         select {
         case <-ctx.Done():
             log.Printf("Context cancelled, closing connection")
@@ -236,7 +232,7 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
 
 func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, *transport.FileMetadata, error) {
     key := fmt.Sprintf("file:%s:%s", userID, filename)
-    metadataJSON, err := m.kvClient.Get(key)
+    metadataJSON, err := m.kvServer.Get(key)
 
     if err != nil {
         return false, nil, fmt.Errorf("failed to get file metadata: %v", err)
@@ -349,7 +345,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 
     for key,chunk_meta := range chunkMetas{
         metaJSON, _ := json.Marshal(chunk_meta)
-        chunkMetaBatch.Add(key,string(metaJSON))
+        chunkMetaBatch.Add("set",key,metaJSON)
     }
 
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
@@ -380,17 +376,30 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
         return err
     }
     // 현재 시간
-    m.kvClient.Set(key, string(metadataJSON))
+    m.kvServer.Set(key, string(metadataJSON))
     
     if !metadata.RetentionTime.IsZero(){
         delete_key := fmt.Sprintf("delete_file:%s:%s:%s",
         metadata.RetentionTime.Format("20060102150405"),
         req.UserID,
         req.Filename)
-        m.kvClient.Set(delete_key, "")
+        m.kvServer.Set(delete_key, "")
     }
 
-    if err := m.kvClient.BatchSet(chunkMetaBatch.GetPairs()); err != nil {
+    buck_metadata, _ := m.HasBucket(ctx,req.UserID)
+    if buck_metadata ==nil{
+        buck_metadata = &transport.BucketMetadata{}
+        buck_metadata.BucketSize= req.FileSize
+        buck_metadata.FileCnt= 1
+    }else{
+        buck_metadata.BucketSize += req.FileSize
+        buck_metadata.FileCnt++
+    }
+    buck_key := fmt.Sprintf("bucket:%s",req.UserID)
+    buckdataJson ,_ := json.Marshal(metadata)
+    m.kvServer.Set(buck_key,string(buckdataJson))
+
+    if err := m.kvServer.BatchOperation(chunkMetaBatch.GetPairs()); err != nil {
         log.Printf("MasterNode: Error setting chunk metadata: %v", err)
         return err
     }
@@ -429,7 +438,7 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
     prefix := fmt.Sprintf("chunk:%s:%s", req.UserID, req.Filename)
     cursor := fmt.Sprintf("%s:%05d", prefix, startChunk)
 
-    chunkMetadata, _, err := m.kvClient.ScanValueByKey(prefix, cursor, int(endChunk-startChunk))
+    chunkMetadata, _, err := m.kvServer.ScanValueByKey(prefix, cursor, int(endChunk-startChunk))
     if err != nil {
         return nil, fmt.Errorf("error fetching chunk metadata: %v", err)
     }
@@ -594,6 +603,8 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
     var wg sync.WaitGroup
     errChan := make(chan error, len(metaData.ChunkNodes))
 
+    var node_err_list []string
+
     for _,nodeID := range metaData.ChunkNodes {
         wg.Add(1)
         go func(nodeID string) {
@@ -607,6 +618,7 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
             err := m.deleteFileFromDataNode(ctx, node.Addr, req.UserID, req.Filename)
             if err != nil {
                 errChan <- fmt.Errorf("failed to delete file from node %s: %v", nodeID, err)
+                node_err_list = append(node_err_list, nodeID)
             }
         }(nodeID)
     }
@@ -615,6 +627,7 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
         wg.Wait()
         close(errChan)
     }()
+
 
     var errs []error
     for err := range errChan {
@@ -625,8 +638,10 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
 
 
     metaKey := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
-    if err := m.kvClient.Delete(metaKey); err !=nil{
-        errs = append(errs, fmt.Errorf("failed to delete metadata: %v",err))
+    err := m.kvServer.Delete(metaKey);
+
+    if err!=nil{
+        return fmt.Errorf("error delete metadata : %v", err)
     }
 
     if !metaData.RetentionTime.IsZero(){
@@ -634,13 +649,38 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
         metaData.RetentionTime.Format("20060102150405"),
         req.UserID,
         req.Filename)
-        if err := m.kvClient.Delete(delete_key); err !=nil{
-            errs = append(errs, fmt.Errorf("to delete key : %v",err))
-        }
+        m.kvServer.Delete(delete_key)
     }
 
-    if len(errs) > 0 {
-        return fmt.Errorf("errors occurred during file deletion: %v", errs)
+    batch := kvclient.NewKVBatch()
+    prefix := fmt.Sprintf("chunk:%s:%s", req.UserID, req.Filename)
+    cursor := fmt.Sprintf("%s:%05d", prefix, 0)
+
+    for {
+        result, err := m.kvServer.ScanKey(prefix, cursor, 1000)
+        if err !=nil{
+            return fmt.Errorf("error when scan key : %v",err)
+        }
+
+        for _,key := range result.Keys{
+            batch.Add("delete",key,nil)
+        }
+
+        if result.NextCursor==""{
+            break
+        }
+        cursor = result.NextCursor
+    }
+
+    for _,err_node :=range node_err_list {
+        key := fmt.Sprintf("error:%s:%s:%s",err_node,req.UserID,req.Filename)
+        batch.Add("set",key,"")
+    }
+
+    err = m.kvServer.BatchOperation(batch.GetPairs());
+
+    if err!=nil{
+        return fmt.Errorf("error: Batch operation error : %v", err)
     }
 
     log.Printf("MasterNode: Successfully deleted file %s for user %s", req.Filename, req.UserID)
@@ -649,7 +689,7 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
 
 
 func (m *MasterNode) deleteFileFromDataNode(ctx context.Context, addr, userID, filename string) error {
-    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+    conn, err := net.Dial("tcp", addr)
     if err != nil {
         return fmt.Errorf("failed to connect to data node: %v", err)
     }
@@ -692,9 +732,54 @@ func (m *MasterNode) deleteFileFromDataNode(ctx context.Context, addr, userID, f
 }
 
 
-func (m *MasterNode) ListFiles(ctx context.Context, req *transport.ListFilesRequest) (*transport.ListFilesResponse, error) {
-	// 구현 로직
-	return nil, nil
+func (m *MasterNode) GetFileList(ctx context.Context, req *transport.FileListRequest) (*transport.ListFilesResponse, error) {
+    ret := &transport.ListFilesResponse{}
+    key := fmt.Sprintf("file:%s",req.Bucket)
+    cursor,err := m.kvServer.ScanOffset(key,req.Offset)
+    if err!=nil{
+        ret.Message = err.Error()
+        ret.Success = false
+        return ret, err
+    }
+    Scanres,err := m.kvServer.ScanKey(key,cursor, req.Limit)
+    if err !=nil{
+        ret.BaseResponse.Message = err.Error()
+        ret.BaseResponse.Success = false
+        return ret, err
+    }
+
+    var files []string
+
+    for _,key := range Scanres.Keys{
+        sp_str := strings.Split(key, ":")
+        if len(sp_str)==3{
+            files = append(files,sp_str[2])
+        }
+    }
+
+    ret.Files = files
+    ret.Success = true
+
+	return ret, nil
+}
+
+func (m *MasterNode) GetBuckets(ctx context.Context,limit, offset int)([]string,error){
+    var ret []string
+
+    cursor,_ := m.kvServer.ScanOffset("bucket:",offset)
+    log.Printf("Key Data %d %s,%v",offset, cursor, limit)
+    Scanres,err := m.kvServer.ScanKey("bucket:",cursor, limit)
+    if err !=nil{
+        return ret, err
+    }
+    
+    for _,key := range Scanres.Keys{
+        _spl := strings.Split(key, ":")
+        ret = append(ret, _spl[1])
+    }
+    
+    
+    return ret,nil
 }
 
 func (m *MasterNode) Start(ctx context.Context) error {
@@ -702,6 +787,8 @@ func (m *MasterNode) Start(ctx context.Context) error {
     go func() {
         errChan <- m.tcpTransport.Serve(ctx)
     }()
+
+    go m.startDeleteTimer()
 
     go func(){
         if err := m.restServer.Serve(ctx); err !=nil{
@@ -735,6 +822,37 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
         ID:   req.NodeID,
         Addr: req.Addr,
     }
+    opCtx := context.Context(context.Background())
+
+    start_key := fmt.Sprintf("error:%s:",req.NodeID)
+    cursor := ""
+    batch := kvclient.NewKVBatch()
+    for{
+        Scanres,err := m.kvServer.ScanKey(start_key,cursor,1000)
+        if err!=nil{
+            break
+        }
+        for _,key := range Scanres.Keys{
+            datas := strings.Split(key, ":")
+            if len(datas)==4{
+                go func(user_id, file_name string){
+                    err:= m.deleteFileFromDataNode(opCtx, req.Addr, user_id, file_name)
+                    if err==nil{
+                        batch.Add("delete",key,"")
+                    }
+                }(datas[2],datas[3])
+            }
+        }
+        if Scanres.NextCursor ==""{
+            break
+        }
+        cursor = Scanres.NextCursor
+    }
+
+    if err:=m.kvServer.BatchOperation(batch.GetPairs()); err!=nil{
+        log.Printf("Error when error operation %v", err)
+        return err
+    }
 
     m.dataNodes[req.NodeID] = nodeInfo
     m.nodeKeys = append(m.nodeKeys, req.NodeID)
@@ -744,23 +862,20 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
 }
 
 
-func (mn *MasterNode) deleteDataNode(nodeID string){
-    mn.nodeMu.Lock()
-    defer mn.nodeMu.Unlock()
-
-    if _, exists := mn.dataNodes[nodeID]; !exists{
+func (m *MasterNode) deleteDataNode(nodeID string){
+    m.nodeMu.Lock()
+    defer m.nodeMu.Unlock()
+    if _, exists := m.dataNodes[nodeID]; !exists{
         return
     }
-
-    for i, key := range mn.nodeKeys{
+    for i, key := range m.nodeKeys{
         if key == nodeID{
-            mn.nodeKeys = append(mn.nodeKeys[:i], mn.nodeKeys[i+1:]...)
+            m.nodeKeys = append(m.nodeKeys[:i], m.nodeKeys[i+1:]...)
             break
         }
     }
-
-    if mn.currentIndex >= len(mn.nodeKeys){
-        mn.currentIndex = 0
+    if m.currentIndex >= len(m.nodeKeys){
+        m.currentIndex = 0
     }
 
 }
@@ -771,62 +886,162 @@ func (m *MasterNode) Register(ctx context.Context, req *transport.RegisterMessag
     return m.handleRegister(req)
 }
 
-func (m *MasterNode) distributeChunks(chunks []*transport.FileChunk) map[string][]*transport.FileChunk {
-    distribution := make(map[string][]*transport.FileChunk)
-    nodeIDs := make([]string, 0, len(m.dataNodes))
-    
-    for nodeID := range m.dataNodes {
-        nodeIDs = append(nodeIDs, nodeID)
-    }
 
-    if len(nodeIDs) == 0 {
-        log.Println("No available data nodes for chunk distribution")
-        return distribution
-    }
 
-    for i, chunk := range chunks {
-        nodeIndex := i % len(nodeIDs)
-        nodeID := nodeIDs[nodeIndex]
-        distribution[nodeID] = append(distribution[nodeID], chunk)
-    }
-
-    // Log distribution information
-    for nodeID, nodeChunks := range distribution {
-        log.Printf("Node %s assigned %d chunks", nodeID, len(nodeChunks))
-    }
-
-    return distribution
-}
-
-func (mn *MasterNode) selectDataNode(replica_num int) []*DataNodeInfo {
-    mn.nodeMu.Lock()
-    defer mn.nodeMu.Unlock()
+func (m *MasterNode) selectDataNode(replica_num int) []*DataNodeInfo {
+    m.nodeMu.Lock()
+    defer m.nodeMu.Unlock()
 
     selectedNodes := []*DataNodeInfo{}
 
-    if len(mn.nodeKeys) == 0 {
+    if len(m.nodeKeys) == 0 {
         return nil // 노드가 없는 경우 빈 슬라이스 반환
     }
 
     // replica_num이 노드 수보다 크다면 모든 노드를 선택
-    if replica_num >= len(mn.nodeKeys) {
-        for _, key := range mn.nodeKeys {
-            selectedNodes = append(selectedNodes, mn.dataNodes[key])
+    if replica_num >= len(m.nodeKeys) {
+        for _, key := range m.nodeKeys {
+            selectedNodes = append(selectedNodes, m.dataNodes[key])
         }
         return selectedNodes
     }
 
     // replica_num만큼의 노드를 선택
     for i := 0; i < replica_num; i++ {
-        selKey := mn.nodeKeys[mn.currentIndex]
-        selectedNodes = append(selectedNodes, mn.dataNodes[selKey])
-        mn.currentIndex = (mn.currentIndex + 1) % len(mn.nodeKeys)
+        selKey := m.nodeKeys[m.currentIndex]
+        selectedNodes = append(selectedNodes, m.dataNodes[selKey])
+        m.currentIndex = (m.currentIndex + 1) % len(m.nodeKeys)
     }
 
     return selectedNodes
 }
 
 
+func (m *MasterNode) startDeleteTimer(){
+    ticker := time.NewTicker(1 * time.Hour)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <- ticker.C:
+            ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+            if err := m.deleteTimer(ctx) ; err != nil{
+                log.Printf("Error in deleteTimer: %v",err)
+            }
+            cancel()
+        case <- m.stopChan:
+            return
+        }
+    }
+}
+
+func (m *MasterNode) deleteTimer(ctx context.Context) error{
+    log.Println("Starting delete timer operation")
+
+    batchSize := 1000
+    stopDel := false
+    var cursor string
+
+    for{
+        select {
+        case <- ctx.Done():
+            return ctx.Err()
+        default:
+        }
+
+        keyData, err := m.kvServer.ScanKey("delete_file:",cursor,batchSize)
+        if err != nil{
+            log.Printf("Error scanning keys: %v", err)
+            return err
+        }
+
+        if len(keyData.Keys) ==0{
+            log.Println("No more keys to process")
+            break
+        }
+
+        delBatch := kvclient.NewKVBatch()
+        var wg sync.WaitGroup
+        errChan := make(chan error, len(keyData.Keys))
+
+        for _, deleteKey := range keyData.Keys{
+            wg.Add(1)
+
+            parse_data := strings.Split(deleteKey, ":")
+
+            if len(parse_data) != 4{
+                delBatch.Add("delete",deleteKey, "")
+                continue
+            }
+
+            delTime , err := time.Parse("20060102150405",parse_data[1])
+            if err != nil{
+                errChan <- fmt.Errorf("invalid timestamp in key %s: %v",deleteKey, err)
+                delBatch.Add("delete",deleteKey, "")
+                continue
+            }
+
+            if time.Now().Before(delTime){
+                stopDel = true
+                break
+            }
+
+            go func(userid,filename,key string){
+                defer wg.Done()
+                delReq := &transport.DeleteFileRequest{
+                    Filename: filename,
+                    UserID: userid,
+                }
+                if err := m.DeleteFile(ctx, delReq); err != nil{
+                    errChan <- fmt.Errorf("failed to delete file for key %s: %v", key, err)
+                    return
+                }
+
+                delBatch.Add("delete",key,"")
+
+            }(parse_data[2], parse_data[3],deleteKey)
+        }
+
+        wg.Wait()
+        close(errChan)
+
+
+        for err := range errChan{
+            log.Printf("Error during deletion : %v", err)
+        }
+
+        if err := m.kvServer.BatchOperation(delBatch.GetPairs()); err != nil {
+            log.Printf("Error in batch deletion of keys: %v", err)
+            return err
+        }
+
+        if stopDel{
+            break
+        }
+        cursor = keyData.NextCursor
+    }
+
+    return nil
+}
+
+func (m *MasterNode) HasBucket(ctx context.Context, bucket string)(*transport.BucketMetadata, error){
+
+    key := fmt.Sprintf("bucket:%s",bucket)
+
+    resp,err := m.kvServer.Get(key)
+
+    if err!=nil{
+        return nil, err
+    }
+
+    var metadata transport.BucketMetadata
+    err = json.Unmarshal([]byte(resp), &metadata)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &metadata,nil
+}
 
 
 func (m *MasterNode) GetConnectedDataNodesCount() int {

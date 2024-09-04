@@ -3,80 +3,126 @@ package rest
 import (
 	"ChestyO/internal/transport"
 	"context"
+	"embed"
+	"html/template"
 	"log"
 	"net/http"
-	"strings"
+	"strconv"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
-var allowedIPs = []string{
-	"172.27.192.1", // 예시 IP 주소, 실제 IP로 변경
-	"172.27.112.1",
+type RestServer struct {
+	server  		*http.Server
+	handler 		RESTService
+	router  		*gin.Engine
+	masterNode 		transport.MasterFileService
 }
 
-type RestServer struct{
-	server		*http.Server
-	handler     RESTService
-}
-
+//go:embed static/*
+var staticFS embed.FS
 
 func NewServer(masterNode transport.MasterFileService, addr string) *RestServer {
-    return &RestServer{
-        server: &http.Server{
-            Addr: addr,
-            ReadTimeout:  10 * time.Minute,
-            WriteTimeout: 10 * time.Minute,
+	router := gin.Default()
+
+    funcMap := template.FuncMap{
+        "sub": func(a, b int) int {
+            return a - b
         },
-        handler: NewRESTHandler(masterNode),
+        "add": func(a, b int) int {
+            return a + b
+        },
     }
+
+
+	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(staticFS, "static/*"))
+	router.SetHTMLTemplate(tmpl)
+	
+	server := &RestServer{
+		server: &http.Server{
+			Addr:         addr,
+			Handler:      router,
+			ReadTimeout:  10 * time.Minute,
+			WriteTimeout: 10 * time.Minute,
+		},
+		handler: NewRESTHandler(masterNode),
+		router:  router,
+		masterNode: masterNode,
+	}
+
+	server.setupRoutes()
+	return server
 }
 
+func (s *RestServer) setupRoutes() {
+	s.router.POST("/upload", gin.WrapF(s.handler.HandleUpload))
+	s.router.GET("/download", gin.WrapF(s.handler.HandleDownload))
+	s.router.DELETE("/delete", gin.WrapF(s.handler.HandleDelete))
+	s.router.POST("/sharetoken", gin.WrapF(s.handler.HandleShareToken))
+	s.router.GET("/sharefile", gin.WrapF(s.handler.HandleShareFileByToken))
 
+	// 대시보드 라우트 추가
+	s.router.GET("/dashboard", s.handleDashboard)
 
-func ipFilterMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		clientIP := strings.Split(r.RemoteAddr, ":")[0]
-        log.Printf("Current ClientIP : %v", clientIP)
-		allowed := false
-		for _, ip := range allowedIPs {
-			if clientIP == ip {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		next(w, r)
-	}
+	// 정적 파일 제공 (HTML, CSS, JS 등)
+	s.router.StaticFS("/static", http.FS(staticFS))
+}
+
+func (s *RestServer) handleDashboard(c *gin.Context) {
+	// 여기서 대시보드에 필요한 데이터를 준비합니다.
+	// 예: 총 파일 수, 저장 공간 사용량 등
+    offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
+    if err != nil {
+        offset = 0
+    }
+    
+    limit, err := strconv.Atoi(c.DefaultQuery("limit", "100"))
+    if err != nil {
+        limit = 100
+    }
+
+	buckets, err := s.masterNode.GetBuckets(c.Request.Context(), limit, offset)
+	log.Printf("error when bucket get : %v",buckets)
+    if err != nil {
+        c.HTML(http.StatusInternalServerError, "error.html", gin.H{"error": err.Error()})
+        return
+    }
+
+    data := gin.H{
+        "title":   "File Storage Dashboard",
+        "buckets": buckets,
+        "offset":  offset,
+        "limit":   limit,
+        "nextOffset": offset + len(buckets),
+    }
+
+	// HTML 파일을 제공합니다.
+	c.HTML(http.StatusOK, "dashboard.html",data)
 }
 
 func (s *RestServer) Serve(ctx context.Context) error {
-    mux := http.NewServeMux()
-    
-    // 라우트 설정
-	mux.HandleFunc("/upload", s.handler.HandleUpload)
-	mux.HandleFunc("/download", ipFilterMiddleware(s.handler.HandleDownload))
-	mux.HandleFunc("/delete", ipFilterMiddleware(s.handler.HandleDelete))
-	mux.HandleFunc("/sharetoken", ipFilterMiddleware(s.handler.HandleShareToken))
-	mux.HandleFunc("/sharefile", s.handler.HandleShareFileByToken) // 공개된 핸들러
-    s.server.Handler = mux
+	log.Printf("Starting REST server on %s", s.server.Addr)
 
-    errChan := make(chan error, 1)
-    go func() {
-        log.Printf("Starting REST server on %s", s.server.Addr)
-        errChan <- s.server.ListenAndServe()
-    }()
+	go func() {
+		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Listen: %s\n", err)
+		}
+	}()
 
-    select {
-    case <-ctx.Done():
-        return s.server.Shutdown(context.Background())
-    case err := <-errChan:
-        return err
-    }
+	<-ctx.Done()
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.server.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+
+	log.Println("Server exiting")
+	return nil
 }
 
 func (s *RestServer) Stop() error {
-    return s.server.Shutdown(context.Background())
+	return s.server.Shutdown(context.Background())
 }

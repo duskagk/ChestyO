@@ -6,6 +6,7 @@ import (
 	"ChestyO/internal/transport"
 	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,32 +16,111 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 type DataNode struct {
-    ID         string
-    store      *store.Store
-    // masterConn net.Conn
-	stopChan chan struct{}
+    ID          string
+    Addr        string
+    MasterAddr  string
+    store       *store.Store
+	stopChan    chan struct{}
 }
 
-func NewDataNode(id string, storeOpts store.StoreOpts,numbuckets int) *DataNode {
+type DataNodeInfo struct {
+    ID              string
+    Addr            string
+    MasterAddr      string
+}
+
+func NewDataNode(rootpath, arg_tcpAddr, arg_masterAddr string) *DataNode {
+	var nodeID string
+	var tcpAddr string
+	var masterAddr string
+
+	// .nodeinfo 파일 경로 정의
+	nodeInfoPath := filepath.Join(rootpath, ".nodeinfo")
+
+
+    // rootpath 디렉토리가 존재하는지 확인하고, 없으면 생성
+	if _, err := os.Stat(rootpath); os.IsNotExist(err) {
+		err := os.MkdirAll(rootpath, os.ModePerm)
+		if err != nil {
+			log.Fatalf("Failed to create root directory: %v", err)
+		}
+		log.Printf("Created root directory: %s", rootpath)
+	}
+
+	// .nodeinfo 파일이 존재하는지 확인
+	if _, err := os.Stat(nodeInfoPath); err == nil {
+		// 파일이 존재하면 파일에서 정보를 읽어옴
+		file, err := os.Open(nodeInfoPath)
+		if err != nil {
+			log.Fatalf("Failed to open .nodeinfo file: %v", err)
+		}
+		defer file.Close()
+
+		decoder := gob.NewDecoder(file)
+		var nodeInfo DataNodeInfo
+		if err := decoder.Decode(&nodeInfo); err != nil {
+			log.Fatalf("Failed to decode .nodeinfo file: %v", err)
+		}
+
+		nodeID = nodeInfo.ID
+		tcpAddr = nodeInfo.Addr
+		masterAddr = nodeInfo.MasterAddr
+
+		log.Printf("Using existing node ID: %s", nodeID)
+		log.Printf("Using existing TCP address: %s", tcpAddr)
+		log.Printf("Using existing Master address: %s", masterAddr)
+	} else {
+		// 파일이 없으면 새로운 UUID 생성
+		u_id := uuid.New()
+		nodeID = u_id.String()
+
+		// .nodeinfo 파일 생성 및 정보 저장
+		file, err := os.Create(nodeInfoPath)
+		if err != nil {
+			log.Fatalf("Failed to create .nodeinfo file: %v", err)
+		}
+		defer file.Close()
+
+		encoder := gob.NewEncoder(file)
+		nodeInfo := DataNodeInfo{ID: nodeID, Addr: arg_tcpAddr, MasterAddr: arg_masterAddr}
+		if err := encoder.Encode(&nodeInfo); err != nil {
+			log.Fatalf("Failed to encode .nodeinfo file: %v", err)
+		}
+        tcpAddr= arg_tcpAddr
+        masterAddr = arg_masterAddr
+
+		log.Printf("Generated new node ID: %s", nodeID)
+		log.Printf("Saved TCP address: %s", arg_tcpAddr)
+		log.Printf("Saved Master address: %s", arg_masterAddr)
+	}
+
+	storeOpts := &store.StoreOpts{
+		Root: fmt.Sprintf("%s/%s", rootpath, nodeID),
+	}
 
 	return &DataNode{
-		ID:    id,
-		store: store.NewStore(storeOpts),
-		stopChan: make(chan struct{}),
+		ID:         nodeID,
+		Addr:       tcpAddr,
+		MasterAddr: masterAddr,
+		store:      store.NewStore(*storeOpts),
+		stopChan:   make(chan struct{}),
 	}
 }
 
 
-func (d *DataNode) Start(ctx context.Context,addr string, masterAddr string) error {
-    if err := d.RegisterWithMaster(addr, masterAddr); err != nil {
+func (d *DataNode) Start(ctx context.Context) error {
+
+    if err := d.RegisterWithMaster(d.Addr, d.MasterAddr); err != nil {
         return fmt.Errorf("failed to register with master: %v", err)
     }
 
     // transport, err := transport.NewTCPTransport(addr, d)
-	transport, err := transport.NewTCPTransport(addr,d)
+	transport, err := transport.NewTCPTransport(d.Addr,d)
     if err != nil {
         return fmt.Errorf("failed to set up TCP transport: %v", err)
     }
@@ -387,7 +467,7 @@ func (d *DataNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequ
 }
 
 // ListFiles lists files in a directory
-func (d *DataNode) ListFiles(ctx context.Context, req *transport.ListFilesRequest) (*transport.ListFilesResponse, error) {
+func (d *DataNode) ListFiles(ctx context.Context, req *transport.FileListRequest) (*transport.ListFilesResponse, error) {
 	files, err := ioutil.ReadDir(filepath.Join(d.store.Root, d.ID))
 	if err != nil {
 		return nil, err

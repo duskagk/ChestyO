@@ -38,7 +38,7 @@ type RequestPayload struct {
     Download       *DownloadFileRequest
     HasFile        *HasFileRequest
     Delete         *DeleteFileRequest
-    List           *ListFilesRequest
+    List           *FileListRequest
     UploadChunk    *UploadFileChunkRequest
     DownLoadChunk  *DownloadChunkRequest
 }
@@ -101,12 +101,15 @@ type DeleteFileResponse struct {
     BaseResponse
 }
 
-type ListFilesRequest struct {
-	Directory string
+type FileListRequest struct {
+	Bucket string
+    Limit  int
+    Offset int
 }
 
 type ListFilesResponse struct {
     BaseResponse
+    Files       []string
 }
 
 
@@ -148,12 +151,19 @@ type FileMetadata struct {
     TotalChunks     int64           `json:"totalChunks"`
     ChunkSize       int64           `json:"chunkSize"`
 }
+
+
 type ChunkMetadata struct {
     ChunkIndex  int                 `json:"chunkIndex"`
     NodeID      []string            `json:"nodeID"`
     Size        int64               `json:"size"`
 }
 
+
+type BucketMetadata struct {
+    FileCnt         int
+    BucketSize      int64
+}
 
 type RegisterMessage struct{
 	NodeID      string

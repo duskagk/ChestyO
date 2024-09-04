@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>File Storage Dashboard</title>
+    <style>
+      /* ... 이전 스타일 유지 ... */
+    </style>
+  </head>
+  <body>
+    <div class="dashboard">
+      <h1>{{ .title }}</h1>
+      <h2>Bucket List</h2>
+      <ul class="bucket-list">
+        {{ range .buckets }}
+        <li
+          class="bucket-item"
+          onclick="window.location.href='/filelist?bucket={{ . }}'"
+        >
+          {{ . }}
+        </li>
+        {{ end }}
+      </ul>
+      <div class="pagination">
+        {{ if gt .offset 0 }}
+        <a href="?offset={{ sub .offset .limit }}&limit={{ .limit }}"
+          >Previous</a
+        >
+        {{ else }}
+        <span></span>
+        {{ end }} {{ if eq (len .buckets) .limit }}
+        <a href="?offset={{ .nextOffset }}&limit={{ .limit }}">Next</a>
+        {{ else }}
+        <span></span>
+        {{ end }}
+      </div>
+      <div class="pagination-info">
+        Showing buckets {{ add .offset 1 }} to {{ add .offset (len .buckets) }}
+      </div>
+    </div>
+  </body>
+</html>

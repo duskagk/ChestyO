@@ -4,10 +4,11 @@ import (
 	"sync"
 )
 
-// KVPair represents a key-value pair
+// KVPair represents a key-value pair with operation type
 type KVPair struct {
+    Type  string      // "set" or "delete"
     Key   string
-    Value string
+    Value interface{} // Changed to interface{} to support various value types
 }
 
 // KVBatch manages a batch of key-value pairs
@@ -24,10 +25,10 @@ func NewKVBatch() *KVBatch {
 }
 
 // Add appends a new key-value pair to the batch
-func (b *KVBatch) Add(key, value string) {
+func (b *KVBatch) Add(type_ string, key string, value interface{}) {
     b.mu.Lock()
     defer b.mu.Unlock()
-    b.pairs = append(b.pairs, KVPair{Key: key, Value: value})
+    b.pairs = append(b.pairs, KVPair{Type: type_, Key: key, Value: value})
 }
 
 // AddPair appends a KVPair to the batch
@@ -66,4 +67,3 @@ func (b *KVBatch) GetPairs() []KVPair {
     copy(pairs, b.pairs)
     return pairs
 }
-
