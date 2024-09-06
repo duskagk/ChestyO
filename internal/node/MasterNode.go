@@ -28,7 +28,7 @@ type MasterNode struct {
     ID              string
     dataNodes       map[string]*DataNodeInfo
     tcpTransport    *transport.TCPTransport
-    restServer      *rest.RestServer
+    restServer      *rest.GinServer
     stopChan        chan struct{}
     kvServer        *kvclient.KVClient
     nodeMu          sync.Mutex
@@ -344,8 +344,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     }
 
     for key,chunk_meta := range chunkMetas{
-        metaJSON, _ := json.Marshal(chunk_meta)
-        chunkMetaBatch.Add("set",key,metaJSON)
+        chunkMetaBatch.Add("set",key,chunk_meta)
     }
 
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
@@ -371,12 +370,8 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     }
 
     key := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
-    metadataJSON, err := json.Marshal(metadata)
-    if err !=nil{
-        return err
-    }
     // 현재 시간
-    m.kvServer.Set(key, string(metadataJSON))
+    m.kvServer.Set(key, metadata)
     
     if !metadata.RetentionTime.IsZero(){
         delete_key := fmt.Sprintf("delete_file:%s:%s:%s",
@@ -396,8 +391,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
         buck_metadata.FileCnt++
     }
     buck_key := fmt.Sprintf("bucket:%s",req.UserID)
-    buckdataJson ,_ := json.Marshal(metadata)
-    m.kvServer.Set(buck_key,string(buckdataJson))
+    m.kvServer.Set(buck_key,buck_metadata)
 
     if err := m.kvServer.BatchOperation(chunkMetaBatch.GetPairs()); err != nil {
         log.Printf("MasterNode: Error setting chunk metadata: %v", err)

@@ -5,7 +5,12 @@ import (
 	"ChestyO/internal/transport"
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"embed"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -18,18 +23,25 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type RestServer struct {
-	// server  		*http.Server
-	// handler 		RESTService
+type GinServer struct {
 	router  		*gin.Engine
 	masterNode 		transport.MasterFileService
 	addr 			string
 }
 
+
+
+type FileInfo struct {
+        UserID    string    `json:"uid"`
+        Filename  string    `json:"fn"`
+        Expiration time.Time `json:"exp"`
+    }
+
+
 //go:embed static/*
 var staticFS embed.FS
-
-func NewServer(masterNode transport.MasterFileService, addr string) *RestServer {
+var secretKey = []byte("a-very-secret-key-32-bytes-long!")
+func NewServer(masterNode transport.MasterFileService, addr string) *GinServer {
 	router := gin.Default()
 
     funcMap := template.FuncMap{
@@ -45,16 +57,8 @@ func NewServer(masterNode transport.MasterFileService, addr string) *RestServer 
 	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(staticFS, "static/*"))
 	router.SetHTMLTemplate(tmpl)
 	
-	router.MaxMultipartMemory = 1<<30
-	server := &RestServer{
-		// server: &http.Server{
-		// 	Addr:         addr,
-		// 	Handler:      router,
-		// 	ReadTimeout:  10 * time.Minute,
-		// 	WriteTimeout: 10 * time.Minute,
-		// },
+	server := &GinServer{
 		addr : addr,
-		// handler: NewRESTHandler(masterNode),
 		router:  router,
 		masterNode: masterNode,
 	}
@@ -63,11 +67,11 @@ func NewServer(masterNode transport.MasterFileService, addr string) *RestServer 
 	return server
 }
 
-func (s *RestServer) setupRoutes() {
+func (s *GinServer) setupRoutes() {
 	s.router.POST("/upload", s.handleUpload)
 	// s.router.GET("/download", gin.WrapF(s.handler.HandleDownload))
-	// s.router.DELETE("/delete", gin.WrapF(s.handler.HandleDelete))
-	// s.router.POST("/sharetoken", gin.WrapF(s.handler.HandleShareToken))
+	s.router.DELETE("/delete", s.handleDelete)
+	s.router.POST("/sharetoken", s.handleShareToken)
 	s.router.GET("/sharefile", s.handleShareFileByToken)
 
 	// 대시보드 라우트 추가
@@ -79,7 +83,7 @@ func (s *RestServer) setupRoutes() {
     s.router.GET("/fileinfo", s.handleFileInfo)
 }
 
-func (s *RestServer) handleDashboard(c *gin.Context) {
+func (s *GinServer) handleDashboard(c *gin.Context) {
 	// 여기서 대시보드에 필요한 데이터를 준비합니다.
 	// 예: 총 파일 수, 저장 공간 사용량 등
     offset, err := strconv.Atoi(c.DefaultQuery("offset", "0"))
@@ -111,7 +115,7 @@ func (s *RestServer) handleDashboard(c *gin.Context) {
 	c.HTML(http.StatusOK, "dashboard.html",data)
 }
 
-func (s *RestServer) handleFileList(c *gin.Context) {
+func (s *GinServer) handleFileList(c *gin.Context) {
     bucket := c.Query("bucket")
     if bucket == "" {
         c.HTML(http.StatusBadRequest, "error.html", gin.H{"error": "Bucket name is required"})
@@ -156,7 +160,7 @@ func (s *RestServer) handleFileList(c *gin.Context) {
     c.HTML(http.StatusOK, "filelist.html", data)
 }
 
-func (s *RestServer) handleFileInfo(c *gin.Context) {
+func (s *GinServer) handleFileInfo(c *gin.Context) {
 	bucket := c.Query("bucket")
 	filename := c.Query("filename")
 
@@ -182,7 +186,7 @@ func (s *RestServer) handleFileInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func (s *RestServer) handleUpload(c *gin.Context){
+func (s *GinServer) handleUpload(c *gin.Context){
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
     defer cancel()
     c.Request = c.Request.WithContext(ctx)
@@ -308,7 +312,7 @@ func (s *RestServer) handleUpload(c *gin.Context){
 }
 
 
-func (s *RestServer) handleShareFileByToken(c *gin.Context) {
+func (s *GinServer) handleShareFileByToken(c *gin.Context) {
     filename := c.Query("file")
     username := c.Query("bucket")
     metadataOnly := c.Query("metadata") == "true"
@@ -401,29 +405,53 @@ func (s *RestServer) handleShareFileByToken(c *gin.Context) {
     }
 }
 
+func (s *GinServer) handleDelete(c *gin.Context){
+    var requestBody struct {
+        Bucket   string `json:"bucket"`
+        Filename string `json:"filename"`
+    }
 
+    if err := c.ShouldBindJSON(&requestBody); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+        return
+    }
 
+    deleteRequest := &transport.DeleteFileRequest{
+        Filename: requestBody.Filename,
+        UserID:   requestBody.Bucket,
+    }
 
+    err := s.masterNode.DeleteFile(c.Request.Context(), deleteRequest)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
 
-func (s *RestServer) Serve(ctx context.Context) error {
-	// log.Printf("Starting REST server on %s", s.server.Addr)
+    c.JSON(http.StatusOK, gin.H{"message": "File delete successfully"})
+}
 
-	// go func() {
-	// 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-	// 		log.Printf("Listen: %s\n", err)
-	// 	}
-	// }()
+func (s *GinServer) handleShareToken(c *gin.Context) {
+    var requestBody struct {
+        UserID   string `json:"user_id"`
+        Filename string `json:"filename"`
+        Expiry   int    `json:"expiry"`
+    }
 
-	// <-ctx.Done()
-	// log.Println("Shutting down server...")
+    if err := c.ShouldBindJSON(&requestBody); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+        return
+    }
 
-	// ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	// defer cancel()
-	// if err := s.server.Shutdown(ctx); err != nil {
-	// 	log.Fatal("Server forced to shutdown:", err)
-	// }
+    token, err := createToken(requestBody.UserID, requestBody.Filename, requestBody.Expiry)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
 
+    c.JSON(http.StatusOK, gin.H{"token": token})
+}
 
+func (s *GinServer) Serve(ctx context.Context) error {
 	go func(){
 		if err := s.router.Run(s.addr); err != nil{
 			log.Printf("Error starting server: %v\n", err)
@@ -439,7 +467,73 @@ func (s *RestServer) Serve(ctx context.Context) error {
 
 
 
-func (s *RestServer) Stop() error {
-	// return s.server.Shutdown(context.Background())
-	return nil
+
+
+
+
+
+
+func createToken(userID, filename string, expiry int) (string, error) {
+    if expiry == 0 {
+        expiry = 7 * 24 * 60 * 60 // 7 days in seconds
+    }
+    
+    info := FileInfo{
+        UserID:    userID,
+        Filename:  filename,
+        Expiration: time.Now().Add(time.Duration(expiry) * time.Second),
+    }
+
+    jsonData, err := json.Marshal(info)
+    if err != nil {
+        return "", err
+    }
+
+    block, err := aes.NewCipher(secretKey)
+    if err != nil {
+        return "", err
+    }
+
+    ciphertext := make([]byte, aes.BlockSize+len(jsonData))
+    iv := ciphertext[:aes.BlockSize]
+    if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+        return "", err
+    }
+
+    stream := cipher.NewCFBEncrypter(block, iv)
+    stream.XORKeyStream(ciphertext[aes.BlockSize:], jsonData)
+
+    return base64.URLEncoding.EncodeToString(ciphertext), nil
+}
+
+func validateToken(token string) (*FileInfo, error) {
+    ciphertext, err := base64.URLEncoding.DecodeString(token)
+    if err != nil {
+        return nil, err
+    }
+
+    block, err := aes.NewCipher(secretKey)
+    if err != nil {
+        return nil, err
+    }
+
+    if len(ciphertext) < aes.BlockSize {
+        return nil, fmt.Errorf("ciphertext too short")
+    }
+    iv := ciphertext[:aes.BlockSize]
+    ciphertext = ciphertext[aes.BlockSize:]
+
+    stream := cipher.NewCFBDecrypter(block, iv)
+    stream.XORKeyStream(ciphertext, ciphertext)
+
+    var info FileInfo
+    if err := json.Unmarshal(ciphertext, &info); err != nil {
+        return nil, err
+    }
+
+    if time.Now().After(info.Expiration) {
+        return nil, fmt.Errorf("token expired")
+    }
+
+    return &info, nil
 }
