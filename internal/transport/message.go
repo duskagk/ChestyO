@@ -63,6 +63,7 @@ type UploadFileRequest struct {
     Content             []byte
     RetentionPeriodDays int  // 새로 추가된 필드
     FileContentType     string
+    // ContentReader       io.Reader
 }
 
 type BaseResponse struct {

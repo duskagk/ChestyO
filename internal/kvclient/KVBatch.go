@@ -6,9 +6,9 @@ import (
 
 // KVPair represents a key-value pair with operation type
 type KVPair struct {
-    Type  string      // "set" or "delete"
-    Key   string
-    Value interface{} // Changed to interface{} to support various value types
+    Type  string      `json:"type"`
+    Key   string      `json:"key"`
+    Value interface{} `json:"value"`
 }
 
 // KVBatch manages a batch of key-value pairs

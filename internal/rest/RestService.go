@@ -79,7 +79,7 @@ func (h *RESTHandler) HandleUpload(w http.ResponseWriter, r *http.Request) {
     }
 
 
-    userID := r.FormValue("user_id")
+    userID := r.FormValue("bucket")
     if userID == "" {
         http.Error(w, "User ID is required", http.StatusBadRequest)
         return
@@ -185,23 +185,16 @@ func (h *RESTHandler) HandleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RESTHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
-
     opCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
     defer cancel()
 
-    if r.Method != http.MethodPost {
+    if r.Method != http.MethodDelete {
         http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
         return
     }
 
-    contentType := r.Header.Get("Content-Type")
-    if contentType != "application/json" {
-        http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
-        return
-    }
-
     var requestBody struct {
-        UserID   string `json:"user_id"`
+        Bucket   string `json:"bucket"`
         Filename string `json:"filename"`
     }
 
@@ -213,11 +206,12 @@ func (h *RESTHandler) HandleDelete(w http.ResponseWriter, r *http.Request) {
 
     deleteRequest := &transport.DeleteFileRequest{
         Filename: requestBody.Filename,
-        UserID: requestBody.UserID,
+        UserID: requestBody.Bucket,
     }
 
     err = h.masterService.DeleteFile(opCtx, deleteRequest)
     if err !=nil{
+        log.Printf("MasterNode Delete Error : %v", err)
         http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
@@ -329,7 +323,7 @@ func (h *RESTHandler) HandleShareFileByToken(w http.ResponseWriter, r *http.Requ
 
 
     filename := r.URL.Query().Get("filename")
-    username := r.URL.Query().Get("user")
+    username := r.URL.Query().Get("bucket")
     metadataOnly := r.URL.Query().Get("metadata") == "true"
 
     exists, metadata, err := h.masterService.HasFile(r.Context(), username, filename)

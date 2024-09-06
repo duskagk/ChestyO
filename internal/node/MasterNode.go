@@ -232,18 +232,18 @@ func (m *MasterNode) handleConnection(ctx context.Context, conn net.Conn) {
 
 func (m *MasterNode) HasFile(ctx context.Context, userID, filename string) (bool, *transport.FileMetadata, error) {
     key := fmt.Sprintf("file:%s:%s", userID, filename)
-    metadataJSON, err := m.kvServer.Get(key)
+    metadatabyte, err := m.kvServer.Get(key)
 
     if err != nil {
         return false, nil, fmt.Errorf("failed to get file metadata: %v", err)
     }
 
-    if metadataJSON == "" {
+    if len(metadatabyte) == 0 {
         return false, nil, nil
     }
 
     var metadata transport.FileMetadata
-    err = json.Unmarshal([]byte(metadataJSON), &metadata)
+    err = json.Unmarshal(metadatabyte, &metadata)
     if err != nil {
         return false, nil, fmt.Errorf("failed to unmarshal file metadata: %v", err)
     }
@@ -450,11 +450,21 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
     for _, chunkData := range chunkMetadata {
         wg.Add(1)
         var chunkMeta transport.ChunkMetadata
-        if err := json.Unmarshal([]byte(chunkData["value"]), &chunkMeta); err != nil {
+        
+        valueJSON, err := json.Marshal(chunkData["value"])
+        if err != nil {
+            log.Printf("Error marshaling chunk metadata: %v", err)
+            wg.Done()
+            continue
+        }
+        
+        // JSON 문자열을 ChunkMetadata 구조체로 언마샬
+        if err := json.Unmarshal(valueJSON, &chunkMeta); err != nil {
             log.Printf("Error unmarshaling chunk metadata: %v", err)
             wg.Done()
             continue
         }
+
         go func(chunk_meta transport.ChunkMetadata) {
             defer wg.Done()
 
@@ -594,10 +604,10 @@ func (m *MasterNode) sendChunkToDataNode(ctx context.Context, stream *transport.
 
 
 func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRequest)  error{
-	exists,metaData,_ := m.HasFile(ctx,req.UserID, req.Filename)
-
+    log.Printf("MasterNode Delete bucket %v file %v", req.UserID, req.Filename)
+	exists,metaData,err := m.HasFile(ctx,req.UserID, req.Filename)
     if !exists {
-        return fmt.Errorf("file %s does not exist for user %s", req.Filename, req.UserID)
+        return fmt.Errorf("MasterNode Hasfile fail : %v", err)
     }
 
     var wg sync.WaitGroup
@@ -638,7 +648,7 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
 
 
     metaKey := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
-    err := m.kvServer.Delete(metaKey);
+    err = m.kvServer.Delete(metaKey);
 
     if err!=nil{
         return fmt.Errorf("error delete metadata : %v", err)
@@ -734,7 +744,7 @@ func (m *MasterNode) deleteFileFromDataNode(ctx context.Context, addr, userID, f
 
 func (m *MasterNode) GetFileList(ctx context.Context, req *transport.FileListRequest) (*transport.ListFilesResponse, error) {
     ret := &transport.ListFilesResponse{}
-    key := fmt.Sprintf("file:%s",req.Bucket)
+    key := fmt.Sprintf("file:%s:",req.Bucket)
     cursor,err := m.kvServer.ScanOffset(key,req.Offset)
     if err!=nil{
         ret.Message = err.Error()
@@ -1024,6 +1034,25 @@ func (m *MasterNode) deleteTimer(ctx context.Context) error{
     return nil
 }
 
+func (m *MasterNode) GetFileMetadata(ctx context.Context, bucket, filename string)(*transport.FileMetadata, error){
+    key := fmt.Sprintf("file:%s:%s",bucket,filename)
+
+    binData,err := m.kvServer.Get(key)
+    if err !=nil{
+        return nil, fmt.Errorf("error File Metadata not exist")
+    }
+
+    var ret transport.FileMetadata
+    if err := json.Unmarshal(binData, &ret); err != nil {
+        if len(binData) == 0 {
+            return nil, fmt.Errorf("file metadata not found")
+        }
+        return nil, fmt.Errorf("failed to unmarshal file metadata: %w", err)
+    }
+
+    return &ret,nil
+}
+
 func (m *MasterNode) HasBucket(ctx context.Context, bucket string)(*transport.BucketMetadata, error){
 
     key := fmt.Sprintf("bucket:%s",bucket)
@@ -1035,7 +1064,7 @@ func (m *MasterNode) HasBucket(ctx context.Context, bucket string)(*transport.Bu
     }
 
     var metadata transport.BucketMetadata
-    err = json.Unmarshal([]byte(resp), &metadata)
+    err = json.Unmarshal(resp, &metadata)
     if err != nil {
         return nil, err
     }

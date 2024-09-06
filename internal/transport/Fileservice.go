@@ -19,6 +19,7 @@ type MasterFileService interface{
     DownloadFile(ctx context.Context, req *DownloadFileRequest) ([]*FileChunk, error)
     GetFileList(ctx context.Context, req *FileListRequest) (*ListFilesResponse, error)
     GetBuckets(ctx context.Context,limit, offset int)([]string,error)
+    GetFileMetadata(ctx context.Context, bucket, filename string)(*FileMetadata, error)
 }
 
 type DataFileService interface {

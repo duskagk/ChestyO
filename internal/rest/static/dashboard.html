@@ -5,7 +5,53 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>File Storage Dashboard</title>
     <style>
-      /* ... 이전 스타일 유지 ... */
+      body {
+        font-family: Arial, sans-serif;
+        line-height: 1.6;
+        margin: 0;
+        padding: 20px;
+      }
+      .dashboard {
+        max-width: 800px;
+        margin: 0 auto;
+      }
+      h1 {
+        color: #333;
+      }
+      .bucket-list {
+        list-style-type: none;
+        padding: 0;
+      }
+      .bucket-item {
+        background-color: #f4f4f4;
+        border-radius: 5px;
+        margin-bottom: 10px;
+        padding: 15px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+      }
+      .bucket-item:hover {
+        background-color: #e0e0e0;
+      }
+      .pagination {
+        margin-top: 20px;
+        display: flex;
+        justify-content: space-between;
+      }
+      .pagination a {
+        padding: 10px 15px;
+        background-color: #007bff;
+        color: white;
+        text-decoration: none;
+        border-radius: 5px;
+      }
+      .pagination a:hover {
+        background-color: #0056b3;
+      }
+      .pagination-info {
+        text-align: center;
+        margin-top: 10px;
+      }
     </style>
   </head>
   <body>

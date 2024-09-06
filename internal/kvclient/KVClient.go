@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 )
@@ -25,13 +26,21 @@ func NewKVClient(host string, port int) *KVClient {
 	}
 }
 
-func (c *KVClient) Set(key, value string) error {
-    data := map[string]string{
-        key: value,
+
+func (c *KVClient) Set(key string, value interface{}) error {
+    // key와 JSON으로 변환된 value를 포함하는 구조체 생성
+    data := struct {
+        Key   string            `json:"key"`
+        Value interface{}       `json:"value"`
+    }{
+        Key:   key,
+        Value: value,
     }
+
     jsonData, err := json.Marshal(data)
+    log.Printf("KVClient make jsondata : %s", string(jsonData))
     if err != nil {
-        return fmt.Errorf("failed to marshal JSON: %v", err)
+        return fmt.Errorf("failed to marshal data: %v", err)
     }
 
     req, err := http.NewRequest("POST", c.BaseURL+"/set", bytes.NewBuffer(jsonData))
@@ -54,8 +63,8 @@ func (c *KVClient) Set(key, value string) error {
     return nil
 }
 
-
 func (c *KVClient) BatchOperation(pairs []KVPair) error {
+    // pairs를 그대로 JSON으로 직렬화
     jsonData, err := json.Marshal(pairs)
     if err != nil {
         return fmt.Errorf("failed to marshal JSON: %v", err)
@@ -82,34 +91,34 @@ func (c *KVClient) BatchOperation(pairs []KVPair) error {
 }
 
 
-func (c *KVClient) Get(key string) (string, error) {
-	resp, err := http.Get(fmt.Sprintf("%s/get?key=%s", c.BaseURL, url.QueryEscape(key)))
-	if err != nil {
-		return "", fmt.Errorf("failed to send request: %v", err)
-	}
-	defer resp.Body.Close()
+func (c *KVClient) Get(key string) ([]byte, error) {
+    resp, err := http.Get(fmt.Sprintf("%s/get?key=%s", c.BaseURL, url.QueryEscape(key)))
+    if err != nil {
+        return nil, fmt.Errorf("failed to send request: %v", err)
+    }
+    defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("failed to read response body: %v", err)
-		}
+    switch resp.StatusCode {
+    case http.StatusOK:
+        body, err := io.ReadAll(resp.Body)
+        if err != nil {
+            return nil, fmt.Errorf("failed to read response body: %v", err)
+        }
+        return body, nil
 
-		var result string
-		if err := json.Unmarshal(body, &result); err != nil {
-			return "", fmt.Errorf("failed to unmarshal response: %v", err)
-		}
+    case http.StatusNoContent:
+        // 데이터가 없는 경우 빈 바이트 슬라이스 반환
+        return []byte{}, nil
 
-		return result, nil
-
-	case http.StatusNoContent:
-		return "", nil // 데이터가 없음을 나타내기 위해 빈 문자열과 nil 에러 반환
-
-	default:
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-	}
+    default:
+        return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+    }
 }
+
+
+
+
+
 
 func (c *KVClient) Delete(key string) error {
 	req, err := http.NewRequest("DELETE", fmt.Sprintf("%s/delete?key=%s", c.BaseURL, url.QueryEscape(key)), nil)
@@ -155,7 +164,7 @@ func (c *KVClient) RangeQuery(startKey, endKey string) (map[string]string, error
 }
 
 
-func (c *KVClient) ScanValueByKey(prefix string, cursor string, limit int) ([]map[string]string, string, error) {
+func (c *KVClient) ScanValueByKey(prefix string, cursor string, limit int) ([]map[string]interface{}, string, error) {
     url := fmt.Sprintf("%s/scanvaluebykey?prefix=%s&cursor=%s&limit=%d", 
         c.BaseURL, url.QueryEscape(prefix), url.QueryEscape(cursor), limit)
     
@@ -170,8 +179,8 @@ func (c *KVClient) ScanValueByKey(prefix string, cursor string, limit int) ([]ma
     }
 
     var result struct {
-        Results    []map[string]string `json:"results"`
-        NextCursor string              `json:"nextCursor"`
+        Results    []map[string]interface{} `json:"results"`
+        NextCursor string                   `json:"nextCursor"`
     }
     if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
         return nil, "", fmt.Errorf("failed to decode response: %v", err)
