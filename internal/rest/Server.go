@@ -10,16 +10,20 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
 
@@ -29,8 +33,13 @@ type GinServer struct {
 	addr 			string
 }
 
-
-
+type contentTypeInfo struct {
+    ContentType string
+}
+const (
+    metadataDir = "/tmp/metadata"
+    uploadsDir  = "/tmp/uploads"
+)
 type FileInfo struct {
         UserID    string    `json:"uid"`
         Filename  string    `json:"fn"`
@@ -54,6 +63,12 @@ func NewServer(masterNode transport.MasterFileService, addr string) *GinServer {
     }
 
 
+    config := cors.DefaultConfig()
+	config.AllowAllOrigins = true
+	config.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+	config.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
+	router.Use(cors.New(config))
+    
 	tmpl := template.Must(template.New("").Funcs(funcMap).ParseFS(staticFS, "static/*"))
 	router.SetHTMLTemplate(tmpl)
 	
@@ -188,134 +203,106 @@ func (s *GinServer) handleFileInfo(c *gin.Context) {
 
 func (s *GinServer) handleUpload(c *gin.Context){
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
-    defer cancel()
-    c.Request = c.Request.WithContext(ctx)
+	defer cancel()
 
-	log.Printf("Start upload handler : %v", c.Request)
-    // 파일 가져오기
+	// 청크 정보 가져오기
+    chunkNumber, _ := strconv.Atoi(c.PostForm("chunkNumber"))
+    totalChunks, _ := strconv.Atoi(c.PostForm("totalChunks"))
+    filename := c.PostForm("filename")
+    userID := c.PostForm("bucket")
+    policyStr := c.PostForm("policy")
+    retentionPeriodStr := c.PostForm("retention_period_days")
 
-    reader, err := c.Request.MultipartReader()
-    if err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Error creating multipart reader"})
-        return
-    }
 
-    var filename string
-    var fileSize int64
     var fileContentType string
-    var userID string
-    var policyStr string
-    var retentionPeriodStr string
-    var content []byte
+    if chunkNumber == 0 {
+        fileContentType = c.PostForm("content_type")
+        log.Printf("Get Content type from chunk 0 : %v", fileContentType)
+        // Content-Type을 서버에 저장 (예: 메모리 또는 데이터베이스)
+        s.saveContentType(userID, filename, fileContentType)
+    }
 
-    // 각 파트 처리
-    for {
-        part, err := reader.NextPart()
-        if err == io.EOF {
-            break
+	// 파일 청크 가져오기
+	file, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Error retrieving the file chunk"})
+		return
+	}
+
+	// 청크 데이터 읽기
+	chunkData, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error reading chunk data"})
+		return
+	}
+	defer chunkData.Close()
+
+	// 청크 저장 (임시 파일 또는 메모리에 저장)
+	err = s.saveChunk(userID, filename, chunkNumber, chunkData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error saving chunk"})
+		return
+	}
+
+	// 마지막 청크인 경우 전체 파일 처리
+	if chunkNumber == totalChunks-1 {
+		var policy enum.UploadPolicy
+		switch policyStr {
+		case "overwrite":
+			policy = enum.Overwrite
+		case "version_control":
+			policy = enum.VersionControl
+		case "no_change":
+			policy = enum.NoChange
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid upload policy"})
+			return
+		}
+
+		retentionPeriodDays, _ := strconv.Atoi(retentionPeriodStr)
+
+		// 전체 파일 조합 및 업로드
+		fileContent, fileSize, err := s.combineChunks(userID, filename, totalChunks)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error combining chunks"})
+			return
+		}
+
+        content_type , err := s.getContentType(userID,filename)
+        if err !=nil{
+            log.Printf("Get content type is error : %v", err)
         }
-        if err != nil {
-            c.JSON(http.StatusInternalServerError, gin.H{"error": "Error reading multipart data"})
-            return
-        }
+		uploadRequest := &transport.UploadFileRequest{
+			UserID:              userID,
+			Filename:            filename,
+			FileSize:            fileSize,
+			Policy:              policy,
+			Content:             fileContent,
+			RetentionPeriodDays: retentionPeriodDays,
+			FileContentType:     content_type,
+		}
 
-        switch part.FormName() {
-        case "file":
-            filename = part.FileName()
-            // 파일 내용을 읽습니다. 주의: 대용량 파일의 경우 메모리 문제가 발생할 수 있습니다.
-            content, err = io.ReadAll(part)
-            if err != nil {
-                c.JSON(http.StatusInternalServerError, gin.H{"error": "Error reading file content"})
-                return
-            }
-            fileSize = int64(len(content))
-        case "bucket":
-            userIDBytes, _ := io.ReadAll(part)
-            userID = string(userIDBytes)
-        case "policy":
-            policyBytes, _ := io.ReadAll(part)
-            policyStr = string(policyBytes)
-        case "retention_period_days":
-            retentionPeriodBytes, _ := io.ReadAll(part)
-            retentionPeriodStr = string(retentionPeriodBytes)
-        case "content_type":
-            contentTypeBytes, _ := io.ReadAll(part)
-            fileContentType = string(contentTypeBytes)
-        }
-    }
-	log.Printf("Get File : %v", filename)
-	if filename == "" || userID == "" || policyStr == "" || fileContentType == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields"})
-        return
-    }
+		err = s.masterNode.UploadFile(ctx, uploadRequest)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 
+		// 임시 청크 파일 삭제
+		s.cleanupChunks(userID, filename)
 
-
-    // 업로드 정책 확인
-
-    var policy enum.UploadPolicy
-    switch policyStr {
-    case "overwrite":
-        policy = enum.Overwrite
-    case "version_control":
-        policy = enum.VersionControl
-    case "no_change":
-        policy = enum.NoChange
-    default:
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid upload policy"})
-        return
-    }
-
-
-    var retentionPeriodDays int
-    if retentionPeriodStr != "" {
-        retentionPeriodDays, err = strconv.Atoi(retentionPeriodStr)
-        if err != nil {
-            c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid retention period"})
-            return
-        }
-        if retentionPeriodDays < -1 {
-            c.JSON(http.StatusBadRequest, gin.H{"error": "Retention period must be -1, 0, or a positive number"})
-            return
-        }
-    } else {
-        retentionPeriodDays = 0
-    }
-
-    // 파일 내용 읽기
-
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Error reading the file"})
-        return
-    }
-
-    // 업로드 요청 생성
-    uploadRequest := &transport.UploadFileRequest{
-        UserID:              userID,
-        Filename:            filename,
-        FileSize:            fileSize,
-        Policy:              policy,
-        Content:             content,
-        RetentionPeriodDays: retentionPeriodDays,
-        FileContentType:     fileContentType,
-    }
-
-    // 파일 업로드 실행
-    err = s.masterNode.UploadFile(ctx, uploadRequest)
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-
-    // 성공 응답
-    c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully"})
+		c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully"})
+	} else {
+		c.JSON(http.StatusOK, gin.H{"message": "Chunk uploaded successfully"})
+	}
 }
+
 
 
 func (s *GinServer) handleShareFileByToken(c *gin.Context) {
     filename := c.Query("file")
     username := c.Query("bucket")
-    metadataOnly := c.Query("metadata") == "true"
+
 
     exists, metadata, err := s.masterNode.HasFile(c.Request.Context(), username, filename)
     if !exists || err != nil {
@@ -324,12 +311,6 @@ func (s *GinServer) handleShareFileByToken(c *gin.Context) {
     }
 
     log.Printf("File Exist Check And metadata : %v %v", exists, metadata)
-
-    if metadataOnly {
-        c.Header("Content-Type", "application/json")
-        c.JSON(http.StatusOK, metadata)
-        return
-    }
 
     rangeHeader := c.GetHeader("Range")
     start, end := int64(0), metadata.FileSize-1
@@ -470,9 +451,6 @@ func (s *GinServer) Serve(ctx context.Context) error {
 
 
 
-
-
-
 func createToken(userID, filename string, expiry int) (string, error) {
     if expiry == 0 {
         expiry = 7 * 24 * 60 * 60 // 7 days in seconds
@@ -536,4 +514,97 @@ func validateToken(token string) (*FileInfo, error) {
     }
 
     return &info, nil
+}
+
+
+
+
+func (s *GinServer) saveChunk(userID, filename string, chunkNumber int, chunkData io.Reader) error {
+	tempDir := filepath.Join(uploadsDir, fmt.Sprintf("%s_%s", userID, filename))
+	if err := os.MkdirAll(tempDir, os.ModePerm); err != nil {
+		return err
+	}
+
+	tempFile := filepath.Join(tempDir, fmt.Sprintf("chunk_%d", chunkNumber))
+	out, err := os.Create(tempFile)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, chunkData)
+	return err
+}
+
+func (s *GinServer) combineChunks(userID, filename string, totalChunks int) ([]byte, int64, error) {
+	tempDir := filepath.Join(uploadsDir, fmt.Sprintf("%s_%s", userID, filename))
+	var combinedFile bytes.Buffer
+	var totalSize int64
+
+	for i := 0; i < totalChunks; i++ {
+		chunkPath := filepath.Join(tempDir, fmt.Sprintf("chunk_%d", i))
+		chunkData, err := os.ReadFile(chunkPath)
+		if err != nil {
+			return nil, 0, err
+		}
+		combinedFile.Write(chunkData)
+		totalSize += int64(len(chunkData))
+	}
+
+	return combinedFile.Bytes(), totalSize, nil
+}
+
+
+func (s *GinServer) cleanupChunks(userID, filename string) {
+	tempDir := filepath.Join(uploadsDir, fmt.Sprintf("%s_%s", userID, filename))
+	os.RemoveAll(tempDir)
+    s.removeContentType(userID, filename)
+}
+
+
+func (s *GinServer) saveContentType(userID, filename, contentType string) error {
+    if err := os.MkdirAll(metadataDir, 0755); err != nil {
+        return fmt.Errorf("error creating metadata directory: %v", err)
+    }
+
+    filePath := filepath.Join(metadataDir, fmt.Sprintf("%s_%s.gob", userID, filename))
+    file, err := os.Create(filePath)
+    if err != nil {
+        return fmt.Errorf("error creating content type file: %v", err)
+    }
+    defer file.Close()
+
+    encoder := gob.NewEncoder(file)
+    info := contentTypeInfo{ContentType: contentType}
+    if err := encoder.Encode(info); err != nil {
+        return fmt.Errorf("error encoding content type: %v", err)
+    }
+
+    return nil
+}
+
+func (s *GinServer) getContentType(userID, filename string) (string, error) {
+    filePath := filepath.Join(metadataDir, fmt.Sprintf("%s_%s.gob", userID, filename))
+    file, err := os.Open(filePath)
+    if err != nil {
+        return "application/octet-stream", fmt.Errorf("error opening content type file: %v", err)
+    }
+    defer file.Close()
+
+    var info contentTypeInfo
+    decoder := gob.NewDecoder(file)
+    if err := decoder.Decode(&info); err != nil {
+        s.removeContentType(userID, filename)
+        return "application/octet-stream", fmt.Errorf("error decoding content type: %v", err)
+    }
+
+    return info.ContentType, nil
+}
+
+func (s *GinServer) removeContentType(userID, filename string) error {
+    filePath := filepath.Join(metadataDir, fmt.Sprintf("%s_%s.gob", userID, filename))
+    if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+        return fmt.Errorf("error removing content type file: %v", err)
+    }
+    return nil
 }
