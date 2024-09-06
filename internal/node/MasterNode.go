@@ -403,7 +403,7 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
 
 
 func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFileRequest) ([]*transport.FileChunk, error) {
-    log.Printf("MasterNode: Starting download for file %s from user %s", req.Filename, req.UserID)
+    log.Printf("MasterNode: Starting download for file %s from user %s, range: %d-%d", req.Filename, req.UserID, req.Start, req.End)
 
     hasFile, metadata, err := m.HasFile(ctx, req.UserID, req.Filename)
     if err != nil {
@@ -413,21 +413,8 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
         return nil, fmt.Errorf("file not found: %s", req.Filename)
     }
 
-    var startChunk int64
-    var endChunk int64
-
-    if req.End ==-1{
-        startChunk = 0
-        endChunk = metadata.TotalChunks
-    }else{
-        startChunk = req.Start / metadata.ChunkSize
-        endChunk = req.End / metadata.ChunkSize
-    
-        if endChunk-startChunk > 10 {
-            endChunk = startChunk + 10
-        }
-    }
-
+    startChunk := req.Start / metadata.ChunkSize
+    endChunk := (req.End + metadata.ChunkSize - 1) / metadata.ChunkSize // Round up to include partial end chunk
 
     prefix := fmt.Sprintf("chunk:%s:%s", req.UserID, req.Filename)
     cursor := fmt.Sprintf("%s:%05d", prefix, startChunk)
@@ -437,64 +424,95 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
         return nil, fmt.Errorf("error fetching chunk metadata: %v", err)
     }
 
-    chunksChan := make(chan *transport.FileChunk, endChunk-startChunk)
-    errChan := make(chan error, endChunk-startChunk)
+    log.Printf("Get Chunk meta data : %v", chunkMetadata)
+    chunksChan := make(chan *transport.FileChunk, len(chunkMetadata))
+    errChan := make(chan error, len(chunkMetadata))
     var wg sync.WaitGroup
 
     for _, chunkData := range chunkMetadata {
         wg.Add(1)
-        var chunkMeta transport.ChunkMetadata
-        
-        valueJSON, err := json.Marshal(chunkData["value"])
-        if err != nil {
-            log.Printf("Error marshaling chunk metadata: %v", err)
-            wg.Done()
-            continue
-        }
-        
-        // JSON 문자열을 ChunkMetadata 구조체로 언마샬
-        if err := json.Unmarshal(valueJSON, &chunkMeta); err != nil {
-            log.Printf("Error unmarshaling chunk metadata: %v", err)
-            wg.Done()
-            continue
-        }
-
-        go func(chunk_meta transport.ChunkMetadata) {
+        go func(chunkData map[string]interface{}) {
             defer wg.Done()
 
-            res_chunk, err := m.requestChunkStream(ctx, chunk_meta.NodeID[0], chunk_meta.ChunkIndex, req)
+            var chunkMeta transport.ChunkMetadata
+            valueJSON, err := json.Marshal(chunkData["value"])
             if err != nil {
-                log.Printf("Error requesting chunk %d: %v", chunk_meta.ChunkIndex, err)
+                log.Printf("Error marshaling chunk metadata: %v", err)
                 errChan <- err
+                return
+            }
+            
+            if err := json.Unmarshal(valueJSON, &chunkMeta); err != nil {
+                log.Printf("Error unmarshaling chunk metadata: %v", err)
+                errChan <- err
+                return
             }
 
-            if chunk_meta.ChunkIndex == int(startChunk) {
-                res_chunk.Content = res_chunk.Content[req.Start%metadata.ChunkSize:]
+            res_chunk, err := m.requestChunkStream(ctx, chunkMeta.NodeID[0], chunkMeta.ChunkIndex, req)
+            if err != nil {
+                log.Printf("Error requesting chunk %d: %v", chunkMeta.ChunkIndex, err)
+                errChan <- err
+                return
+            }
+            
+            if chunkMeta.ChunkIndex == int(startChunk) {
+                startOffset := req.Start % metadata.ChunkSize
+                res_chunk.Content = res_chunk.Content[startOffset:]
+            }
+            if chunkMeta.ChunkIndex == int(endChunk-1) {
+                endOffset := (req.End % metadata.ChunkSize) + 1
+                if endOffset < int64(len(res_chunk.Content)) {
+                    res_chunk.Content = res_chunk.Content[:endOffset]
+                }
             }
 
             chunksChan <- res_chunk
             
-            log.Printf("Push Chunk Channel Index %v Len %v", res_chunk.Index, len(res_chunk.Content))
+            log.Printf("Processed chunk: Index %v, Length %v", res_chunk.Index, len(res_chunk.Content))
 
-        }(chunkMeta)
+        }(chunkData)
     }
 
     go func() {
         wg.Wait()
         close(chunksChan)
+        close(errChan)
     }()
 
-    // Collect all chunks from the channel
     var chunks []*transport.FileChunk
-    for chunk := range chunksChan {
-        chunks = append(chunks, chunk)
-        req.Length += int64(len(chunk.Content))
+    var processError error
+    for i := 0; i < len(chunkMetadata); i++ {
+        select {
+        case chunk, ok := <-chunksChan:
+            if !ok {
+                continue
+            }
+            chunks = append(chunks, chunk)
+            req.Length += int64(len(chunk.Content))
+        case err, ok := <-errChan:
+            if !ok {
+                continue
+            }
+            if err != nil {
+                processError = err
+                log.Printf("Error processing chunk: %v", err)
+            }
+        }
     }
 
-    // Sort chunks by ChunkIndex
+    if processError != nil {
+        return nil, fmt.Errorf("error processing chunks: %v", processError)
+    }
+
+    if len(chunks) == 0 {
+        return nil, fmt.Errorf("no chunks were processed successfully")
+    }
+
     sort.Slice(chunks, func(i, j int) bool {
         return chunks[i].Index < chunks[j].Index
     })
+
+    log.Printf("Download completed for file %s, total chunks: %d, total length: %d", req.Filename, len(chunks), req.Length)
 
     return chunks, nil
 }

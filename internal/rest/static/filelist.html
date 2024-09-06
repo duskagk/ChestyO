@@ -230,7 +230,7 @@
         html += '<div id="filePreview">';
         if (info.contentType.startsWith("video/")) {
           html +=
-            '<video width="320" height="240" controls><source src="/sharefile?bucket=' +
+            '<video controls preload="metadata"><source src="/sharefile?bucket=' +
             encodeURIComponent(info.bucket) +
             "&file=" +
             encodeURIComponent(info.filename) +
@@ -262,6 +262,13 @@
         html += "</div>";
 
         $("#fileInfo").html(html);
+
+        if (info.contentType.startsWith("video/")) {
+          const videoElement = document.getElementById("videoPlayer");
+          if (videoElement) {
+            setupVideo(videoElement);
+          }
+        }
       }
 
       function formatFileSize(bytes) {
@@ -270,6 +277,29 @@
         const sizes = ["Bytes", "KB", "MB", "GB", "TB"];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+      }
+
+      function setupVideo(videoElement) {
+        if (!videoElement) return;
+
+        videoElement.preload = "metadata";
+        videoElement.addEventListener("canplay", function () {
+          // Set the amount of seconds to load
+          videoElement.buffered.end(0) - videoElement.buffered.start(0) < 10 &&
+            videoElement.load();
+        });
+        videoElement.addEventListener("progress", function () {
+          var range = 0;
+          var bf = this.buffered;
+          var time = this.currentTime;
+          while (!(bf.start(range) <= time && time <= bf.end(range))) {
+            range += 1;
+          }
+          var loadStartPercentage = bf.start(range) / this.duration;
+          var loadEndPercentage = bf.end(range) / this.duration;
+          var loadPercentage = loadEndPercentage - loadStartPercentage;
+          // You can use these values to show a custom loading bar
+        });
       }
     </script>
   </body>

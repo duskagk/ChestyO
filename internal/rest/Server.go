@@ -3,6 +3,7 @@ package rest
 import (
 	"ChestyO/internal/enum"
 	"ChestyO/internal/transport"
+	"ChestyO/internal/utils"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -297,12 +298,9 @@ func (s *GinServer) handleUpload(c *gin.Context){
 	}
 }
 
-
-
 func (s *GinServer) handleShareFileByToken(c *gin.Context) {
     filename := c.Query("file")
     username := c.Query("bucket")
-
 
     exists, metadata, err := s.masterNode.HasFile(c.Request.Context(), username, filename)
     if !exists || err != nil {
@@ -314,23 +312,30 @@ func (s *GinServer) handleShareFileByToken(c *gin.Context) {
 
     rangeHeader := c.GetHeader("Range")
     start, end := int64(0), metadata.FileSize-1
+    var contentLength int64
 
     if rangeHeader != "" {
         if strings.HasPrefix(rangeHeader, "bytes=") {
             rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
             rangeParts := strings.Split(rangeStr, "-")
-            if len(rangeParts) == 2 {
+            if len(rangeParts) > 0 {
                 start, _ = strconv.ParseInt(rangeParts[0], 10, 64)
-                if rangeParts[1] != "" {
+                if len(rangeParts) > 1 && rangeParts[1] != "" {
                     end, _ = strconv.ParseInt(rangeParts[1], 10, 64)
-                } else {
-                    end = metadata.FileSize-1
                 }
             }
         }
+        contentLength = end - start + 1
+
+        maxResponseSize := int64(utils.ChunkSize)
+        if contentLength > maxResponseSize {
+            end = start + maxResponseSize - 1
+            contentLength = maxResponseSize
+        }
     } else {
         start = 0
-        end = -1
+        end = metadata.FileSize - 1
+        contentLength = metadata.FileSize
     }
 
     ctx, cancel := context.WithCancel(c.Request.Context())
@@ -345,28 +350,31 @@ func (s *GinServer) handleShareFileByToken(c *gin.Context) {
 
     chunks, err := s.masterNode.DownloadFile(ctx, downloadRequest)
     if err != nil {
-        c.String(http.StatusInternalServerError, err.Error())
+        log.Printf("Error downloading file: %v", err)
+        c.String(http.StatusInternalServerError, "Error downloading file")
         return
     }
 
-    totalLength := int64(0)
-    for _, chunk := range chunks {
-        totalLength += int64(len(chunk.Content))
+    if len(chunks) == 0 {
+        log.Printf("No chunks returned for file: %s", filename)
+        c.String(http.StatusInternalServerError, "No data available")
+        return
     }
 
     c.Header("Content-Type", metadata.ContentType)
     c.Header("Accept-Ranges", "bytes")
     c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", filename))
-    c.Header("Content-Length", fmt.Sprintf("%d", totalLength))
+    c.Header("Content-Length", fmt.Sprintf("%d", contentLength))
 
     if rangeHeader != "" {
-        log.Printf("Content Range End : %v", downloadRequest.End)
+        log.Printf("Content Range: bytes %d-%d/%d", start, end, metadata.FileSize)
         c.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.FileSize))
         c.Status(http.StatusPartialContent)
     } else {
         c.Status(http.StatusOK)
     }
 
+    bytesWritten := int64(0)
     for _, chunk := range chunks {
         select {
         case <-ctx.Done():
@@ -374,17 +382,124 @@ func (s *GinServer) handleShareFileByToken(c *gin.Context) {
             return
         default:
             reader := bytes.NewReader(chunk.Content)
-            bytesWritten, err := io.Copy(c.Writer, reader)
+            written, err := io.Copy(c.Writer, reader)
             if err != nil {
-                log.Printf("Error writing to response: %v", err)
+                log.Printf("Error writing chunk to response: %v", err)
                 return
             }
-            log.Printf("Written by IO Copy %v byte", bytesWritten)
+            bytesWritten += written
+            log.Printf("Written chunk: Index %d, Length %d", chunk.Index, written)
     
             c.Writer.Flush()
+
+            if bytesWritten >= contentLength {
+                log.Printf("Completed writing file: %s, Total bytes written: %d", filename, bytesWritten)
+                return
+            }
         }
     }
+
+    if bytesWritten < contentLength {
+        log.Printf("Warning: Incomplete file transfer. Expected %d bytes, wrote %d bytes", contentLength, bytesWritten)
+    }
 }
+
+// func (s *GinServer) handleShareFileByToken(c *gin.Context) {
+//     filename := c.Query("file")
+//     username := c.Query("bucket")
+
+//     exists, metadata, err := s.masterNode.HasFile(c.Request.Context(), username, filename)
+//     if !exists || err != nil {
+//         c.String(http.StatusBadRequest, "File not found")
+//         return
+//     }
+
+//     log.Printf("File Exist Check And metadata : %v %v", exists, metadata)
+
+//     rangeHeader := c.GetHeader("Range")
+//     start, end := int64(0), metadata.FileSize-1
+//     var contentLength int64
+
+//     if rangeHeader != "" {
+//         if strings.HasPrefix(rangeHeader, "bytes=") {
+//             rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
+//             rangeParts := strings.Split(rangeStr, "-")
+//             if len(rangeParts) > 0 {
+//                 start, _ = strconv.ParseInt(rangeParts[0], 10, 64)
+//                 if len(rangeParts) > 1 && rangeParts[1] != "" {
+//                     end, _ = strconv.ParseInt(rangeParts[1], 10, 64)
+//                 }
+//             }
+//         }
+//         contentLength = end - start + 1
+
+//         maxResponseSize := int64(utils.ChunkSize)
+//         if contentLength > maxResponseSize {
+//             end = start + maxResponseSize - 1
+//             contentLength = maxResponseSize
+//         }
+//     } else {
+//         start = 0
+//         end = metadata.FileSize - 1
+//         contentLength = metadata.FileSize
+//     }
+
+
+
+//     ctx, cancel := context.WithCancel(c.Request.Context())
+//     defer cancel()
+
+//     downloadRequest := &transport.DownloadFileRequest{
+//         Filename: filename,
+//         UserID:   username,
+//         Start:    start,
+//         End:      end,
+//     }
+
+//     chunks, err := s.masterNode.DownloadFile(ctx, downloadRequest)
+//     if err != nil {
+//         c.String(http.StatusInternalServerError, err.Error())
+//         return
+//     }
+
+
+//     c.Header("Content-Type", metadata.ContentType)
+//     c.Header("Accept-Ranges", "bytes")
+//     c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", filename))
+//     c.Header("Content-Length", fmt.Sprintf("%d", contentLength))
+
+//     if rangeHeader != "" {
+//         log.Printf("Content Range End : %v", downloadRequest.End)
+//         c.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, metadata.FileSize))
+//         c.Status(http.StatusPartialContent)
+//     } else {
+//         c.Status(http.StatusOK)
+//     }
+
+//     bytesWritten := int64(0)
+//     for _, chunk := range chunks {
+//         select {
+//         case <-ctx.Done():
+//             log.Println("Client disconnected during response")
+//             return
+//         default:
+//             reader := bytes.NewReader(chunk.Content)
+//             written, err := io.Copy(c.Writer, reader)
+//             if err != nil {
+//                 log.Printf("Error writing to response: %v", err)
+//                 return
+//             }
+//             bytesWritten += written
+//             log.Printf("Written by IO Copy %v byte", written)
+    
+//             c.Writer.Flush()
+
+//             if bytesWritten >= contentLength {
+//                 return
+//             }
+//         }
+//     }
+// }
 
 func (s *GinServer) handleDelete(c *gin.Context){
     var requestBody struct {
