@@ -24,6 +24,7 @@ const (
     MessageOperation_LIST
     MessageOperation_UPLOAD_CHUNK
     MessageOperation_DOWNLOAD_CHUNK
+    MessageOperation_KEEP_ALIVE
 )
 
 type Message struct {
@@ -41,6 +42,7 @@ type RequestPayload struct {
     List           *FileListRequest
     UploadChunk    *UploadFileChunkRequest
     DownLoadChunk  *DownloadChunkRequest
+    KeepAlive       *KeepAliveMessage
 }
 
 type ResponsePayload struct {
@@ -174,6 +176,10 @@ type RegisterMessage struct{
 type HasFileRequest struct {
     UserID   string
     Filename string
+}
+
+type KeepAliveMessage struct{
+    NodeID   string
 }
 
 type HasFileResponse struct {

@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -25,6 +27,8 @@ type DataNode struct {
     Addr        string
     MasterAddr  string
     store       *store.Store
+    isConnected bool
+    mu          sync.Mutex
 	stopChan    chan struct{}
 }
 
@@ -129,6 +133,8 @@ func (d *DataNode) Start(ctx context.Context) error {
     go func() {
         errChan <- transport.Serve(ctx)
     }()
+
+    go d.keepAlive(ctx)
 
     select {
     case <-ctx.Done():
@@ -618,9 +624,64 @@ func (d *DataNode) RegisterWithMaster(addr,masterAddr string) error {
         log.Printf("Connection error : %v",err)
         return err
     }
+
+    d.setConnected(true)
+
     return nil
 }
 
 
 
+func (d *DataNode) keepAlive(ctx context.Context) {
+    keepAliveTicker := time.NewTicker(30 * time.Second)
+    reconnectTicker := time.NewTicker(3 * time.Second)
+    defer keepAliveTicker.Stop()
+    defer reconnectTicker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-keepAliveTicker.C:
+            if d.isConnected {
+                if err := d.sendKeepAlive(); err != nil {
+                    d.setConnected(false)
+                }
+            }
+        case <-reconnectTicker.C:
+            if !d.isConnected {
+                if err := d.RegisterWithMaster(d.Addr, d.MasterAddr); err == nil {
+                    d.setConnected(true)
+                    log.Printf("DataNode %s: Reconnected to Master", d.ID)
+                }
+            }
+        }
+    }
+}
+
+func (d *DataNode) sendKeepAlive() error {
+    conn, err := net.DialTimeout("tcp", d.MasterAddr, 5*time.Second)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+
+    stream := transport.NewTCPStream(conn)
+    msg := &transport.Message{
+        Category:  transport.MessageCategory_REQUEST,
+        Operation: transport.MessageOperation_KEEP_ALIVE,
+        Payload: &transport.RequestPayload{
+            KeepAlive: &transport.KeepAliveMessage{
+                NodeID: d.ID,
+            },
+        },
+    }
+    return stream.Send(msg)
+}
+
+func (d *DataNode) setConnected(status bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.isConnected = status
+}
 
