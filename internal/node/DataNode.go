@@ -391,7 +391,7 @@ func (d *DataNode) handleDeleteFile(ctx context.Context, stream transport.TCPStr
             },
         }
 
-        if sendErr := stream.SendAndClose(response); sendErr != nil {
+        if sendErr := stream.Send(response); sendErr != nil {
             return fmt.Errorf("failed to send response: %v", sendErr)
         }
 

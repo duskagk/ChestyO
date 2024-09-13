@@ -36,6 +36,12 @@ type MasterNode struct {
 	currentIndex    int                      // 현재 라운드 로빈 인덱스
 }
 
+
+type StreamNodePair struct {
+    Stream *transport.StreamService
+    Node   *DataNodeInfo
+}
+
 func NewMasterNode(tcpAddr, httpAddr string) *MasterNode {
     m := &MasterNode{
         // ID:             id,
@@ -283,121 +289,52 @@ func (m *MasterNode) handleNewUpload(ctx context.Context, req *transport.UploadF
     chunks := utils.SplitFileIntoChunks(req.Content)
     log.Printf("MasterNode: File split into %d chunks", len(chunks))
 
-    selNodes := m.selectDataNode(1)
+    fileMetadata := &transport.FileMetadata{
+        FileSize:    int64(len(req.Content)),
+        ContentType: req.FileContentType,
+        TotalChunks: int64(len(chunks)),
+        ChunkSize:   utils.ChunkSize,
+    }
 
-    var wg sync.WaitGroup
-    errChan := make(chan error, 1)
+    if req.RetentionPeriodDays > 0 {
+        fileMetadata.RetentionTime = time.Now().AddDate(0, 0, req.RetentionPeriodDays)
+    } else {
+        fileMetadata.RetentionTime = time.Now().AddDate(0, 0, 90)
+    }
 
-    ctx, cancel := context.WithCancel(ctx)
-    defer cancel()
-
-    chunkMetas := make(map[string]*transport.ChunkMetadata)
-    var chunkMetasMutex sync.Mutex
-
-
-    chunkMetaBatch := kvclient.NewKVBatch()
-
-
-    for _, node := range selNodes {
-        conn, err := net.Dial("tcp",node.Addr)
-        if err!=nil{
-            errChan <- err
-        }
-        stream := transport.NewTCPStream(conn)
-        for i, chunk := range chunks{
-            wg.Add(1)
-            
-            go func(inx int,chunk *transport.FileChunk,nodeID string){
-                defer wg.Done()
-                if err := m.sendChunkToDataNode(ctx,stream,req.UserID,req.Filename,chunk); err!=nil{
-                    errChan <- err
-                }
-                
-                chunkKey := fmt.Sprintf("chunk:%s:%s:%05d", req.UserID, req.Filename, inx)
-                
-                chunkMetasMutex.Lock()
-                if _, exists := chunkMetas[chunkKey]; !exists {
-                    chunkMetas[chunkKey] = &transport.ChunkMetadata{
-                        ChunkIndex: inx,
-                        NodeID:     []string{},
-                        Size:       int64(len(chunk.Content)),
-                    }
-                }
-                chunkMetas[chunkKey].NodeID = append(chunkMetas[chunkKey].NodeID, nodeID)
-                chunkMetasMutex.Unlock()
-            }(i,chunk,node.ID)
-        }
+    replica := 2 // 복제본 수
+    node_list,err := m.uploadChunksToNodes(ctx, req, chunks, replica);
+    // 청크 업로드
+    if err != nil {
+        return fmt.Errorf("failed to upload chunks: %v", err)
     }
 
 
+    fileMetadata.ChunkNodes = node_list
 
-    go func() {
-        wg.Wait()
-        close(errChan)
-    }()
+    // 파일 메타데이터 저장
+    fileKey := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
+    if err := m.kvServer.Set(fileKey, fileMetadata); err != nil {
+        return fmt.Errorf("failed to save file metadata: %v", err)
+    }
 
-    for err := range errChan {
-        if err != nil {
-            log.Printf("MasterNode: Error during upload: %v", err)
-            return err
+    // 삭제 키 설정
+    if !fileMetadata.RetentionTime.IsZero() {
+        deleteKey := fmt.Sprintf("delete_file:%s:%s:%s",
+            fileMetadata.RetentionTime.Format("20060102150405"),
+            req.UserID,
+            req.Filename)
+        if err := m.kvServer.Set(deleteKey, ""); err != nil {
+            log.Printf("Failed to set delete key: %v", err)
         }
     }
 
-    for key,chunk_meta := range chunkMetas{
-        chunkMetaBatch.Add("set",key,chunk_meta)
+    // 버킷 메타데이터 업데이트
+    if err := m.updateBucketMetadata(ctx, req.UserID, fileMetadata.FileSize); err != nil {
+        log.Printf("Failed to update bucket metadata: %v", err)
     }
 
     log.Printf("MasterNode: Upload completed for file %s", req.Filename)
-
-    nodeIDs := make([]string, len(selNodes))
-    for i, node := range selNodes {
-        nodeIDs[i] = node.ID
-    }
-
-
-    metadata := transport.FileMetadata{
-        FileSize:      int64(len(req.Content)),
-        ChunkNodes:    nodeIDs,
-        ContentType: req.FileContentType,
-        TotalChunks: int64(len(chunks)),
-        ChunkSize: utils.ChunkSize,
-    }
-
-    if req.RetentionPeriodDays>0{
-        metadata.RetentionTime = time.Now().AddDate(0,0,req.RetentionPeriodDays)
-    }else if req.RetentionPeriodDays==0{
-        metadata.RetentionTime = time.Now().AddDate(0,0,90)
-    }
-
-    key := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
-    // 현재 시간
-    m.kvServer.Set(key, metadata)
-    
-    if !metadata.RetentionTime.IsZero(){
-        delete_key := fmt.Sprintf("delete_file:%s:%s:%s",
-        metadata.RetentionTime.Format("20060102150405"),
-        req.UserID,
-        req.Filename)
-        m.kvServer.Set(delete_key, "")
-    }
-
-    buck_metadata, _ := m.HasBucket(ctx,req.UserID)
-    if buck_metadata ==nil{
-        buck_metadata = &transport.BucketMetadata{}
-        buck_metadata.BucketSize= req.FileSize
-        buck_metadata.FileCnt= 1
-    }else{
-        buck_metadata.BucketSize += req.FileSize
-        buck_metadata.FileCnt++
-    }
-    buck_key := fmt.Sprintf("bucket:%s",req.UserID)
-    m.kvServer.Set(buck_key,buck_metadata)
-
-    if err := m.kvServer.BatchOperation(chunkMetaBatch.GetPairs()); err != nil {
-        log.Printf("MasterNode: Error setting chunk metadata: %v", err)
-        return err
-    }
-
     return nil
 }
 
@@ -517,11 +454,16 @@ func (m *MasterNode) DownloadFile(ctx context.Context, req *transport.DownloadFi
     return chunks, nil
 }
 
-func (m *MasterNode) requestChunkStream(ctx context.Context,node_id string,chunk_index int,req *transport.DownloadFileRequest) (*transport.FileChunk,error){
-    conn, err := net.Dial("tcp", m.dataNodes[node_id].Addr)
-    
-    if err!=nil{
-        return nil,fmt.Errorf("failed to connect to DataNode %s: %v", node_id, err)
+func (m *MasterNode) requestChunkStream(ctx context.Context, nodeID string, chunkIndex int, req *transport.DownloadFileRequest) (*transport.FileChunk, error) {
+    // 컨텍스트에 타임아웃 추가 (예: 30초)
+    ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
+
+    // 컨텍스트를 사용하여 연결 시도
+    var d net.Dialer
+    conn, err := d.DialContext(ctx, "tcp", m.dataNodes[nodeID].Addr)
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to DataNode %s: %v", nodeID, err)
     }
     defer conn.Close()
 
@@ -531,36 +473,61 @@ func (m *MasterNode) requestChunkStream(ctx context.Context,node_id string,chunk
         Operation: transport.MessageOperation_DOWNLOAD_CHUNK,
         Payload: &transport.RequestPayload{
             DownLoadChunk: &transport.DownloadChunkRequest{
-                UserID:   req.UserID,
-                Filename: req.Filename,
-                ChunkIndex: chunk_index,
+                UserID:     req.UserID,
+                Filename:   req.Filename,
+                ChunkIndex: chunkIndex,
             },
         },
     }
 
-    if err := stream.Send(request); err != nil {
-        return nil,fmt.Errorf("failed to send download request to DataNode %s: %v", node_id, err)
+    // 요청 전송
+    errChan := make(chan error, 1)
+    go func() {
+        errChan <- stream.Send(request)
+    }()
+
+    select {
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    case err := <-errChan:
+        if err != nil {
+            return nil, fmt.Errorf("failed to send download request to DataNode %s: %v", nodeID, err)
+        }
     }
 
-    response, err := stream.Recv()
-    if err == io.EOF {
-        return nil,fmt.Errorf("The stream from DataNode %s is end", node_id)
-    }
-    if err != nil {
-        return nil,fmt.Errorf("error receiving chunk from DataNode %s: %v", node_id, err)
-    }
+    // 응답 수신
+    responseChan := make(chan *transport.Message, 1)
+    errorChan := make(chan error, 1)
+    go func() {
+        response, err := stream.Recv()
+        if err != nil {
+            errorChan <- err
+            return
+        }
+        responseChan <- response
+    }()
 
-    if response.Category == transport.MessageCategory_RESPONSE && response.Operation == transport.MessageOperation_DOWNLOAD_CHUNK {
-        payload, ok := response.Payload.(*transport.ResponsePayload)
-        if !ok || payload.DownloadChunk == nil {
-            return nil,fmt.Errorf("invalid payload for download chunk from DataNode %s", node_id)
+    select {
+    case <-ctx.Done():
+        return nil, ctx.Err()
+    case err := <-errorChan:
+        if err == io.EOF {
+            return nil, fmt.Errorf("the stream from DataNode %s is end", nodeID)
         }
-        if payload.DownloadChunk.Success && payload.DownloadChunk.Message == "All chunks sent" {
-            log.Printf("All chunks received from DataNode %s", node_id)
+        return nil, fmt.Errorf("error receiving chunk from DataNode %s: %v", nodeID, err)
+    case response := <-responseChan:
+        if response.Category == transport.MessageCategory_RESPONSE && response.Operation == transport.MessageOperation_DOWNLOAD_CHUNK {
+            payload, ok := response.Payload.(*transport.ResponsePayload)
+            if !ok || payload.DownloadChunk == nil {
+                return nil, fmt.Errorf("invalid payload for download chunk from DataNode %s", nodeID)
+            }
+            if payload.DownloadChunk.Success && payload.DownloadChunk.Message == "All chunks sent" {
+                log.Printf("All chunks received from DataNode %s", nodeID)
+            }
+            return &payload.DownloadChunk.Chunk, nil
         }
-        return &payload.DownloadChunk.Chunk,nil
+        return nil, fmt.Errorf("no Data request")
     }
-    return nil,fmt.Errorf("No Data request")
 }
 
 
@@ -623,23 +590,32 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
     }
 
     var wg sync.WaitGroup
-    errChan := make(chan error, len(metaData.ChunkNodes))
+    errChan := make(chan string, len(metaData.ChunkNodes))
 
     var node_err_list []string
-
+    
     for _,nodeID := range metaData.ChunkNodes {
         wg.Add(1)
         go func(nodeID string) {
             defer wg.Done()
             node, ok := m.dataNodes[nodeID]
+            log.Printf("Node not register :%v , is ok : %v", node,ok)
             if !ok {
-                errChan <- fmt.Errorf("data node %s not found", nodeID)
+                errChan <- nodeID
                 return
             }
 
-            err := m.deleteFileFromDataNode(ctx, node.Addr, req.UserID, req.Filename)
+            conn, err := net.Dial("tcp", node.Addr)
+            if err !=nil{
+                log.Printf("Dial Datanode failed : %v", err)
+                errChan <- nodeID
+                return
+            }
+            stream := transport.NewTCPStream(conn)
+            defer stream.CloseStream()
+            err = m.deleteFileFromDataNode(ctx, stream, req.UserID, req.Filename)
             if err != nil {
-                errChan <- fmt.Errorf("failed to delete file from node %s: %v", nodeID, err)
+                errChan <- node.ID
                 node_err_list = append(node_err_list, nodeID)
             }
         }(nodeID)
@@ -649,14 +625,6 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
         wg.Wait()
         close(errChan)
     }()
-
-
-    var errs []error
-    for err := range errChan {
-        if err != nil {
-            errs = append(errs, err)
-        }
-    }
 
 
     metaKey := fmt.Sprintf("file:%s:%s", req.UserID, req.Filename)
@@ -680,7 +648,7 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
 
     for {
         result, err := m.kvServer.ScanKey(prefix, cursor, 1000)
-        if err !=nil{
+        if err != nil{
             return fmt.Errorf("error when scan key : %v",err)
         }
 
@@ -694,8 +662,8 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
         cursor = result.NextCursor
     }
 
-    for _,err_node :=range node_err_list {
-        key := fmt.Sprintf("error:%s:%s:%s",err_node,req.UserID,req.Filename)
+    for err_node :=range errChan {
+        key := fmt.Sprintf("error_delete:%s:%s:%s",err_node,req.UserID,req.Filename)
         batch.Add("set",key,"")
     }
 
@@ -709,48 +677,47 @@ func (m *MasterNode) DeleteFile(ctx context.Context, req *transport.DeleteFileRe
     return nil
 }
 
-
-func (m *MasterNode) deleteFileFromDataNode(ctx context.Context, addr, userID, filename string) error {
-    conn, err := net.Dial("tcp", addr)
-    if err != nil {
-        return fmt.Errorf("failed to connect to data node: %v", err)
-    }
-    defer conn.Close()
-
-    stream := transport.NewTCPStream(conn)
-
-    request := &transport.Message{
-        Category:  transport.MessageCategory_REQUEST,
-        Operation: transport.MessageOperation_DELETE,
-        Payload: &transport.RequestPayload{
-            Delete: &transport.DeleteFileRequest{
-                UserID:   userID,
-                Filename: filename,
+func (m *MasterNode) deleteFileFromDataNode(ctx context.Context, stream *transport.StreamService, userID, filename string) error {
+    
+    select {
+    case <- ctx.Done():
+        return fmt.Errorf("delete Tiem out")
+    default:
+        request := &transport.Message{
+            Category:  transport.MessageCategory_REQUEST,
+            Operation: transport.MessageOperation_DELETE,
+            Payload: &transport.RequestPayload{
+                Delete: &transport.DeleteFileRequest{
+                    UserID:   userID,
+                    Filename: filename,
+                },
             },
-        },
+        }
+    
+        log.Printf("Send delete file request")
+    
+        if err := stream.Send(request); err != nil {
+            log.Printf("Is error : %v", err)
+            return fmt.Errorf("failed to send delete request: %v", err)
+        }
+    
+        response, err := stream.CloseAndRecv()
+        // response, err := stream.Recv()
+        if err != nil {
+            return fmt.Errorf("failed to receive delete response: %v", err)
+        }
+    
+        payload, ok := response.Payload.(*transport.ResponsePayload)
+        if !ok || payload.Delete == nil {
+            return fmt.Errorf("invalid response from data node")
+        }
+    
+        if !payload.Delete.Success {
+            return fmt.Errorf("data node failed to delete file: %s", payload.Delete.Message)
+        }
+    
+        return nil
     }
-
-    log.Printf("Send delete file request")
-
-    if err := stream.Send(request); err != nil {
-        return fmt.Errorf("failed to send delete request: %v", err)
-    }
-
-    response, err := stream.CloseAndRecv()
-    if err != nil {
-        return fmt.Errorf("failed to receive delete response: %v", err)
-    }
-
-    payload, ok := response.Payload.(*transport.ResponsePayload)
-    if !ok || payload.Delete == nil {
-        return fmt.Errorf("invalid response from data node")
-    }
-
-    if !payload.Delete.Success {
-        return fmt.Errorf("data node failed to delete file: %s", payload.Delete.Message)
-    }
-
-    return nil
 }
 
 
@@ -844,37 +811,7 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
         ID:   req.NodeID,
         Addr: req.Addr,
     }
-    opCtx := context.Context(context.Background())
 
-    start_key := fmt.Sprintf("error:%s:",req.NodeID)
-    cursor := ""
-    batch := kvclient.NewKVBatch()
-    for{
-        Scanres,err := m.kvServer.ScanKey(start_key,cursor,1000)
-        if err!=nil{
-            break
-        }
-        for _,key := range Scanres.Keys{
-            datas := strings.Split(key, ":")
-            if len(datas)==4{
-                go func(user_id, file_name string){
-                    err:= m.deleteFileFromDataNode(opCtx, req.Addr, user_id, file_name)
-                    if err==nil{
-                        batch.Add("delete",key,"")
-                    }
-                }(datas[2],datas[3])
-            }
-        }
-        if Scanres.NextCursor ==""{
-            break
-        }
-        cursor = Scanres.NextCursor
-    }
-
-    if err:=m.kvServer.BatchOperation(batch.GetPairs()); err!=nil{
-        log.Printf("Error when error operation %v", err)
-        return err
-    }
 
     m.dataNodes[req.NodeID] = nodeInfo
     m.nodeKeys = append(m.nodeKeys, req.NodeID)
@@ -884,23 +821,7 @@ func (m *MasterNode) handleRegister(req *transport.RegisterMessage) error {
 }
 
 
-func (m *MasterNode) deleteDataNode(nodeID string){
-    m.nodeMu.Lock()
-    defer m.nodeMu.Unlock()
-    if _, exists := m.dataNodes[nodeID]; !exists{
-        return
-    }
-    for i, key := range m.nodeKeys{
-        if key == nodeID{
-            m.nodeKeys = append(m.nodeKeys[:i], m.nodeKeys[i+1:]...)
-            break
-        }
-    }
-    if m.currentIndex >= len(m.nodeKeys){
-        m.currentIndex = 0
-    }
 
-}
 
 
 func (m *MasterNode) Register(ctx context.Context, req *transport.RegisterMessage) error {
@@ -908,49 +829,120 @@ func (m *MasterNode) Register(ctx context.Context, req *transport.RegisterMessag
     return m.handleRegister(req)
 }
 
+func (m *MasterNode) getStream(streamNum int) []StreamNodePair {
+    m.nodeMu.Lock()
+    nodeKeys := make([]string, len(m.nodeKeys))
+    copy(nodeKeys, m.nodeKeys)
+    currentIndex := m.currentIndex
+    m.nodeMu.Unlock()
 
+    selectedPairs := make([]StreamNodePair, 0, streamNum)
+    if len(nodeKeys) == 0 {
+        return nil
+    }
 
-func (m *MasterNode) selectDataNode(replica_num int) []*DataNodeInfo {
+    tmpConList := make(map[string]bool, streamNum)
+    ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+    defer cancel()
+
+    startIndex := currentIndex
+    for len(selectedPairs) < streamNum {
+        select {
+        case <-ctx.Done():
+            return selectedPairs
+        default:
+            if currentIndex >= len(nodeKeys) {
+                currentIndex = 0
+            }
+
+            nodeKey := nodeKeys[currentIndex]
+            if tmpConList[nodeKey] || (currentIndex == startIndex && len(selectedPairs) > 0) {
+                break
+            }
+
+            tmpConList[nodeKey] = true
+            
+            m.nodeMu.Lock()
+            node, exists := m.dataNodes[nodeKey]
+            m.nodeMu.Unlock()
+
+            if !exists {
+                currentIndex = (currentIndex + 1) % len(nodeKeys)
+                continue
+            }
+            
+            if stream := m.dialAndCreateStream(node); stream != nil {
+                selectedPairs = append(selectedPairs, StreamNodePair{Stream: stream, Node: node})
+            } else {
+                go m.removeErrorNode(node.ID)
+            }
+
+            currentIndex = (currentIndex + 1) % len(nodeKeys)
+        }
+    }
+
+    m.nodeMu.Lock()
+    m.currentIndex = currentIndex
+    m.nodeMu.Unlock()
+
+    return selectedPairs
+}
+
+func (m *MasterNode) removeErrorNode(nodeID string) {
+    m.deleteDataNode(nodeID)
+    log.Printf("Removed error node: %s", nodeID)
+}
+
+func (m *MasterNode) deleteDataNode(nodeID string) {
     m.nodeMu.Lock()
     defer m.nodeMu.Unlock()
 
-    selectedNodes := []*DataNodeInfo{}
-
-    if len(m.nodeKeys) == 0 {
-        return nil // 노드가 없는 경우 빈 슬라이스 반환
+    if _, exists := m.dataNodes[nodeID]; !exists {
+        return
     }
 
-    // replica_num이 노드 수보다 크다면 모든 노드를 선택
-    if replica_num >= len(m.nodeKeys) {
-        for _, key := range m.nodeKeys {
-            selectedNodes = append(selectedNodes, m.dataNodes[key])
+    delete(m.dataNodes, nodeID)
+    for i, key := range m.nodeKeys {
+        if key == nodeID {
+            m.nodeKeys = append(m.nodeKeys[:i], m.nodeKeys[i+1:]...)
+            break
         }
-        return selectedNodes
     }
 
-    // replica_num만큼의 노드를 선택
-    for i := 0; i < replica_num; i++ {
-        selKey := m.nodeKeys[m.currentIndex]
-        selectedNodes = append(selectedNodes, m.dataNodes[selKey])
-        m.currentIndex = (m.currentIndex + 1) % len(m.nodeKeys)
+    if m.currentIndex >= len(m.nodeKeys) {
+        m.currentIndex = 0
     }
-
-    return selectedNodes
 }
 
 
+func (m *MasterNode) dialAndCreateStream(node *DataNodeInfo) *transport.StreamService {
+    conn, err := net.DialTimeout("tcp", node.Addr, time.Second*3)
+    if err != nil {
+        log.Printf("Failed to connect to node %s: %v", node.ID, err)
+        return nil
+    }
+    return transport.NewTCPStream(conn)
+}
+
+
+
 func (m *MasterNode) startDeleteTimer(){
-    ticker := time.NewTicker(1 * time.Hour)
+    log.Println("=======Start Delete Timer=======")
+    ticker := time.NewTicker(1 * time.Minute)
     defer ticker.Stop()
 
     for {
         select {
         case <- ticker.C:
-            ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-            if err := m.deleteTimer(ctx) ; err != nil{
-                log.Printf("Error in deleteTimer: %v",err)
-            }
-            cancel()
+            log.Printf("TICK DELETE TIMER : %v",time.Now())
+
+            go func(){
+                ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+                defer cancel()
+                if err := m.deleteTimer(ctx); err != nil{
+                    log.Printf("Error in deleteTimer : %v", err)
+                }
+            }()
         case <- m.stopChan:
             return
         }
@@ -958,7 +950,7 @@ func (m *MasterNode) startDeleteTimer(){
 }
 
 func (m *MasterNode) deleteTimer(ctx context.Context) error{
-    log.Println("Starting delete timer operation")
+    log.Println("=======Starting delete timer operation=======")
 
     batchSize := 1000
     stopDel := false
@@ -987,8 +979,6 @@ func (m *MasterNode) deleteTimer(ctx context.Context) error{
         errChan := make(chan error, len(keyData.Keys))
 
         for _, deleteKey := range keyData.Keys{
-            wg.Add(1)
-
             parse_data := strings.Split(deleteKey, ":")
 
             if len(parse_data) != 4{
@@ -1003,11 +993,14 @@ func (m *MasterNode) deleteTimer(ctx context.Context) error{
                 continue
             }
 
+
+            log.Printf("Set up stop del if time : %v before delTime : %v", time.Now(),delTime)
+            
             if time.Now().Before(delTime){
                 stopDel = true
                 break
             }
-
+            wg.Add(1)
             go func(userid,filename,key string){
                 defer wg.Done()
                 delReq := &transport.DeleteFileRequest{
@@ -1015,15 +1008,17 @@ func (m *MasterNode) deleteTimer(ctx context.Context) error{
                     UserID: userid,
                 }
                 if err := m.DeleteFile(ctx, delReq); err != nil{
+                    log.Printf("Delete File Error : %v",err)
                     errChan <- fmt.Errorf("failed to delete file for key %s: %v", key, err)
                     return
                 }
 
                 delBatch.Add("delete",key,"")
-
+                log.Printf("Delete for batch set :%v",key)
             }(parse_data[2], parse_data[3],deleteKey)
         }
-
+        log.Printf("Delete for loop end")
+        
         wg.Wait()
         close(errChan)
 
@@ -1037,11 +1032,77 @@ func (m *MasterNode) deleteTimer(ctx context.Context) error{
             return err
         }
 
+        log.Printf("Stop delete is : %v", stopDel)
         if stopDel{
             break
         }
         cursor = keyData.NextCursor
     }
+
+    log.Printf("Start error log delete")
+    var errorWg sync.WaitGroup
+    for nodeID,node := range m.dataNodes {
+        errorWg.Add(1)
+        go func(node *DataNodeInfo) {
+            defer errorWg.Done()
+            startKey := fmt.Sprintf("error_delete:%s:", node.ID)
+            errorCursor := ""
+
+
+
+            errorBatch := kvclient.NewKVBatch()
+            for {
+                errorKeyData, err := m.kvServer.ScanKey(startKey, errorCursor, batchSize)
+                if err != nil {
+                    log.Printf("Error scanning error_delete keys for node %s: %v", nodeID, err)
+                    return
+                }
+                log.Printf("Error batch node : %v, key : %v", node, startKey)
+                if len(errorKeyData.Keys) == 0 {
+                    break
+                }
+                for _, errorKey := range errorKeyData.Keys {
+                    errorParts := strings.Split(errorKey, ":")
+                    if len(errorParts) == 4 {
+                        userID, fileName := errorParts[2], errorParts[3]
+                        conn, err := net.Dial("tcp",node.Addr)
+                        if err != nil{
+                            return
+                        }
+                        stream := transport.NewTCPStream(conn)
+                        
+                        var wg sync.WaitGroup
+                        wg.Add(1)
+                        go func(_stream *transport.StreamService, user_id, file_name string){
+                            defer _stream.CloseStream()
+                            defer wg.Done()
+                            err = m.deleteFileFromDataNode(ctx,_stream,user_id, file_name)
+                            if err != nil{
+                                log.Printf("Delete Error log file : %v",err)
+                            }else{
+                                errorBatch.Add("delete", errorKey, "")
+                            }
+                        }(stream, userID, fileName)
+                        wg.Wait()
+                    }
+                    
+                }
+                if len(errorBatch.GetPairs()) > 0 {
+                    if err := m.kvServer.BatchOperation(errorBatch.GetPairs()); err != nil {
+                        log.Printf("Error in batch deletion of error_delete keys: %v", err)
+                        break
+                    }
+                }
+                if errorKeyData.NextCursor == "" {
+                    break
+                }
+                startKey = errorKeyData.NextCursor
+            }
+        }(node)
+    }
+    errorWg.Wait()
+
+    log.Printf("End delete timer operation")
 
     return nil
 }
@@ -1084,6 +1145,149 @@ func (m *MasterNode) HasBucket(ctx context.Context, bucket string)(*transport.Bu
     return &metadata,nil
 }
 
+func (m *MasterNode) uploadChunksToNodes(ctx context.Context, req *transport.UploadFileRequest, chunks []*transport.FileChunk, replica int) ([]string, error) {
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(chunks)*replica)
+    chunkMetas := make(map[string]*transport.ChunkMetadata)
+    var chunkMetasMutex sync.Mutex
+
+    // var tmp_node_list map[string]bool
+    tmp_node_list := make(map[string]bool)
+
+    for inx, chunk := range chunks {
+        chunkKey := fmt.Sprintf("chunk:%s:%s:%05d", req.UserID, req.Filename, inx)
+        streamPairs := m.getStream(replica)
+
+        for _, pair := range streamPairs {
+            wg.Add(1)
+            go func(pair StreamNodePair, chunkIndex int, chunkContent *transport.FileChunk) {
+                defer wg.Done()
+                err := m.sendChunkToDataNode(ctx, pair.Stream, req.UserID, req.Filename, chunkContent)
+                if err != nil {
+                    errChan <- fmt.Errorf("failed to upload chunk %d to node %s: %v", chunkIndex, pair.Node.ID, err)
+                    return
+                }
+
+                chunkMetasMutex.Lock()
+                if _, exists := chunkMetas[chunkKey]; !exists {
+                    chunkMetas[chunkKey] = &transport.ChunkMetadata{
+                        ChunkIndex: chunkIndex,
+                        NodeID:     []string{},
+                        Size:       int64(len(chunkContent.Content)),
+                    }
+                }
+
+
+                tmp_node_list[pair.Node.ID] = true
+                chunkMetas[chunkKey].NodeID = append(chunkMetas[chunkKey].NodeID, pair.Node.ID)
+                chunkMetasMutex.Unlock()
+            }(pair, inx, chunk)
+        }
+    }
+
+    go func() {
+        wg.Wait()
+        close(errChan)
+    }()
+
+    var uploadErrors []error
+    for err := range errChan {
+        uploadErrors = append(uploadErrors, err)
+    }
+
+    for _, er := range uploadErrors{
+        log.Printf("Upload error occur : %v", er)
+    }    
+
+
+
+    // 하나라도 청크 업로드 실패 시 전체 삭제 하고 리턴
+    for inx,chunk := range chunkMetas{
+        if len(chunk.NodeID) == 0{
+            go m.asyncDeleteUploadedChunks(req.UserID, req.Filename, tmp_node_list)
+            return nil, fmt.Errorf("failed to save chunk : %v", inx)
+        }
+    }
+
+
+
+    // 청크 메타데이터 저장
+    chunkMetaBatch := kvclient.NewKVBatch()
+    for key, chunkMeta := range chunkMetas {
+        chunkMetaBatch.Add("set", key, chunkMeta)
+    }
+    if err := m.kvServer.BatchOperation(chunkMetaBatch.GetPairs()); err != nil {
+        return nil,fmt.Errorf("failed to save chunk metadata: %v", err)
+    }
+
+
+    var ret_node_list []string
+    for id := range tmp_node_list{
+        ret_node_list = append(ret_node_list, id)
+    }
+
+    return ret_node_list,nil
+}
+
+
+
+func (m *MasterNode) asyncDeleteUploadedChunks(userID, filename string, nodeList map[string]bool) {
+    // 입력받은 ctx를 기반으로 새로운 컨텍스트를 생성합니다.
+    // 5분의 타임아웃을 설정하지만, 부모 컨텍스트가 취소되면 함께 취소됩니다.
+    deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+    defer cancel()
+
+    var wg sync.WaitGroup
+    for nodeID := range nodeList {
+        wg.Add(1)
+        go func(nodeID string) {
+            defer wg.Done()
+            select {
+            case <-deleteCtx.Done():
+                log.Printf("Deletion cancelled for node %s: %v", nodeID, deleteCtx.Err())
+                return
+            default:
+                conn, err := net.DialTimeout("tcp", m.dataNodes[nodeID].Addr, 10*time.Second)
+                if err != nil {
+                    log.Printf("Failed to connect to node %s for deletion: %v", nodeID, err)
+                    return
+                }
+                defer conn.Close()
+                
+                stream := transport.NewTCPStream(conn)
+                if err := m.deleteFileFromDataNode(deleteCtx, stream, userID, filename); err != nil {
+                    log.Printf("Failed to delete file from node %s: %v", nodeID, err)
+                } else {
+                    log.Printf("Successfully deleted file from node %s", nodeID)
+                }
+            }
+        }(nodeID)
+    }
+
+    // 비동기적으로 완료를 기다립니다.
+    go func() {
+        wg.Wait()
+        log.Printf("Async deletion process completed for user %s, file %s", userID, filename)
+    }()
+
+    log.Printf("Async deletion process started for user %s, file %s", userID, filename)
+}
+
+
+func (m *MasterNode) updateBucketMetadata(ctx context.Context, userID string, fileSize int64) error {
+    buckKey := fmt.Sprintf("bucket:%s", userID)
+    buckMetadata, _ := m.HasBucket(ctx, userID)
+    if buckMetadata == nil {
+        buckMetadata = &transport.BucketMetadata{
+            BucketSize: fileSize,
+            FileCnt:    1,
+        }
+    } else {
+        buckMetadata.BucketSize += fileSize
+        buckMetadata.FileCnt++
+    }
+    return m.kvServer.Set(buckKey, buckMetadata)
+}
 
 func (m *MasterNode) GetConnectedDataNodesCount() int {
     return len(m.dataNodes)
